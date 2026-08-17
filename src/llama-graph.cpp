@@ -1929,6 +1929,16 @@ llm_graph_qkv llm_graph_context::build_qkv(
     return { Qcur, Kcur, Vcur };
 }
 
+// Tensor parallelism reduce (no weight transfer). No-op when no callback is set.
+static ggml_tensor * tp_reduce(ggml_context * ctx, ggml_tensor * cur) {
+    if (!llama_tp_reduce_enabled()) {
+        return cur;
+    }
+    ggml_tensor * args[1] = { cur };
+    return ggml_custom_4d(ctx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3],
+                          args, 1, llama_tp_reduce_fun, 1, nullptr);
+}
+
 
 ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * cur,
@@ -2145,6 +2155,8 @@ ggml_tensor * llm_graph_context::build_ffn(
         cur = ggml_mul(ctx0, cur, down_s);
         cb(cur, "ffn_down_s", il);
     }
+
+    cur = tp_reduce(ctx0, cur);
 
     return cur;
 }
@@ -3187,6 +3199,8 @@ ggml_tensor * llm_graph_context::build_attn(
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
+
+    cur = tp_reduce(ctx0, cur);
 
     return cur;
 }

@@ -4226,6 +4226,28 @@ bool llama_get_causal_attn(const llama_context * ctx) {
     return ctx->get_causal_attn();
 }
 
+// tensor parallelism reduce (no weight transfer)
+static llama_tp_reduce_callback g_tp_reduce_callback = nullptr;
+static void * g_tp_reduce_userdata = nullptr;
+
+void llama_set_tp_reduce_callback(llama_tp_reduce_callback callback, void * userdata) {
+    g_tp_reduce_callback = callback;
+    g_tp_reduce_userdata = userdata;
+}
+
+bool llama_tp_reduce_enabled() {
+    return g_tp_reduce_callback != nullptr;
+}
+
+void llama_tp_reduce_fun(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    (void) ith; (void) nth; (void) userdata;
+    const ggml_tensor * src = dst->src[0];
+    memcpy(dst->data, src->data, ggml_nbytes(src));
+    if (g_tp_reduce_callback) {
+        g_tp_reduce_callback(dst->data, ggml_nbytes(dst), g_tp_reduce_userdata);
+    }
+}
+
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
 }
