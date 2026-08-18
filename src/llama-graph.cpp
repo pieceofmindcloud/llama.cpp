@@ -3453,6 +3453,14 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    // Tensor parallelism: a projecao de saida da atencao e row-parallel,
+    // entao cada rank produz uma soma parcial que precisa ser reduzida.
+    // Faltava em todas as sobrecargas com cache KV - so a variante
+    // no_cache tinha o reduce -, e um modelo de 32 camadas somava 32 vezes
+    // em vez de 64: FFN reduzido, atencao nao. A resposta saia fluente e
+    // sem sentido, que e o disfarce mais perigoso deste defeito.
+    cur = tp_reduce(ctx0, cur);
+
     return cur;
 }
 
@@ -3541,6 +3549,14 @@ ggml_tensor * llm_graph_context::build_attn(
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
+
+    // Tensor parallelism: a projecao de saida da atencao e row-parallel,
+    // entao cada rank produz uma soma parcial que precisa ser reduzida.
+    // Faltava em todas as sobrecargas com cache KV - so a variante
+    // no_cache tinha o reduce -, e um modelo de 32 camadas somava 32 vezes
+    // em vez de 64: FFN reduzido, atencao nao. A resposta saia fluente e
+    // sem sentido, que e o disfarce mais perigoso deste defeito.
+    cur = tp_reduce(ctx0, cur);
 
     return cur;
 }
@@ -3656,6 +3672,14 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    // Tensor parallelism: a projecao de saida da atencao e row-parallel,
+    // entao cada rank produz uma soma parcial que precisa ser reduzida.
+    // Faltava em todas as sobrecargas com cache KV - so a variante
+    // no_cache tinha o reduce -, e um modelo de 32 camadas somava 32 vezes
+    // em vez de 64: FFN reduzido, atencao nao. A resposta saia fluente e
+    // sem sentido, que e o disfarce mais perigoso deste defeito.
+    cur = tp_reduce(ctx0, cur);
+
     return cur;
 }
 
@@ -3754,6 +3778,14 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    // Tensor parallelism: a projecao de saida da atencao e row-parallel,
+    // entao cada rank produz uma soma parcial que precisa ser reduzida.
+    // Faltava em todas as sobrecargas com cache KV - so a variante
+    // no_cache tinha o reduce -, e um modelo de 32 camadas somava 32 vezes
+    // em vez de 64: FFN reduzido, atencao nao. A resposta saia fluente e
+    // sem sentido, que e o disfarce mais perigoso deste defeito.
+    cur = tp_reduce(ctx0, cur);
+
     return cur;
 }
 
@@ -3822,6 +3854,14 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    // Tensor parallelism: a projecao de saida da atencao e row-parallel,
+    // entao cada rank produz uma soma parcial que precisa ser reduzida.
+    // Faltava em todas as sobrecargas com cache KV - so a variante
+    // no_cache tinha o reduce -, e um modelo de 32 camadas somava 32 vezes
+    // em vez de 64: FFN reduzido, atencao nao. A resposta saia fluente e
+    // sem sentido, que e o disfarce mais perigoso deste defeito.
+    cur = tp_reduce(ctx0, cur);
+
     return cur;
 }
 
@@ -3879,6 +3919,14 @@ ggml_tensor * llm_graph_context::build_attn(
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
+
+    // Tensor parallelism: a projecao de saida da atencao e row-parallel,
+    // entao cada rank produz uma soma parcial que precisa ser reduzida.
+    // Faltava em todas as sobrecargas com cache KV - so a variante
+    // no_cache tinha o reduce -, e um modelo de 32 camadas somava 32 vezes
+    // em vez de 64: FFN reduzido, atencao nao. A resposta saia fluente e
+    // sem sentido, que e o disfarce mais perigoso deste defeito.
+    cur = tp_reduce(ctx0, cur);
 
     return cur;
 }
