@@ -2287,7 +2287,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn_external(
         llama_expert_gating_func_type gating_op,
         bool          weight_before_ffn,
         int           il) const {
-    if (context == nullptr || (!cparams.moe_external_executor && cparams.cb_moe_ffn == nullptr)) {
+    const bool external_for_layer = cparams.moe_external_executor &&
+        (cparams.moe_external_executor_layers == nullptr ||
+         (il >= 0 && static_cast<size_t>(il) < cparams.moe_external_executor_layer_count &&
+          cparams.moe_external_executor_layers[il] != 0));
+    if (context == nullptr || (!external_for_layer && cparams.cb_moe_ffn == nullptr)) {
         return nullptr;
     }
 
@@ -2547,7 +2551,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // exact expert ids and weights that native llama.cpp would use. Returning
     // immediately is essential: no native expert matmul is added to the
     // graph when the opt-in callback is installed.
-    if (cparams.moe_external_executor || cparams.cb_moe_ffn != nullptr) {
+    const bool external_for_layer = cparams.moe_external_executor &&
+        (cparams.moe_external_executor_layers == nullptr ||
+         (il >= 0 && static_cast<size_t>(il) < cparams.moe_external_executor_layer_count &&
+          cparams.moe_external_executor_layers[il] != 0));
+    if (external_for_layer || (cparams.cb_moe_ffn != nullptr && !cparams.moe_external_executor)) {
         ggml_tensor * selected_for_external = llama_moe_reshape_route_2d(
             ctx0, selected_experts, n_expert_used, n_tokens);
         ggml_tensor * weights_for_external = llama_moe_reshape_route_2d(

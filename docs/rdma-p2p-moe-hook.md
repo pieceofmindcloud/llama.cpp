@@ -37,13 +37,17 @@ the non-contiguous case from becoming an assertion in the native graph.
 
 `llama_model_params::moe_external_executor` is the second, independent opt-in.
 When it is false, the loader and model buffers are unchanged. When it is true,
-the common loader classifies routed expert tensors by the generic
+the optional `moe_external_executor_layers` byte list selects ownership per
+layer: byte `1` makes that layer metadata-only, while byte `0` leaves its
+experts fully native. An empty list preserves the legacy global opt-in and
+selects every layer. The common loader classifies routed expert tensors by the generic
 `llm_tensor` semantic (`FFN_*_EXP`, `FFN_*_EXPS`, and the grouped expert
 variants), regardless of architecture or GGML dtype. Those tensors are created
-in a `no_alloc` metadata context and retain their GGUF name, rank, shape and
-dtype, but they are not put in a backend buffer and `load_all_data` never reads
-their payload into llama.cpp. The context is owned by `llama_model` only to
-keep the descriptor metadata alive.
+in a `no_alloc` metadata context only for externally owned layers and retain
+their GGUF name, rank, shape and dtype, but they are not put in a backend buffer
+and `load_all_data` never reads their payload into llama.cpp. Native layers keep
+their upstream allocation and execution. The ownership list is copied into
+`llama_model` so the caller may release its parameter storage after loading.
 
 The routed expert bytes remain the responsibility of the Rust `MoeRuntime` and
 its local cache. Shared-expert tensors (`FFN_*_SHEXP`) are intentionally not
@@ -62,6 +66,12 @@ the Rust `ModelCache` identity; a dense/native load and a metadata-only load of
 the same GGUF can never share a cached `llama_model`. At runtime, an external
 model without an installed callback is rejected at the decode boundary instead
 of falling back to native experts.
+
+The graph applies the same per-layer decision: an externally owned layer is
+replaced by the callback, and a native layer follows the upstream expert graph.
+If a model has no device bridge for its dtype, the Rust side passes zero for
+every layer and records the concrete dtype as the reason; this is an explicit
+native decision, not a silent fallback or a partially unloaded model.
 
 The extension is intentionally kept at the common graph boundary so future
 upstream changes can be reviewed against one point. Changes in model-specific

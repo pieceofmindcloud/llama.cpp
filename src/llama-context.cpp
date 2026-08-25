@@ -211,6 +211,8 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.moe_external_executor  = model.uses_external_moe_executor();
+    cparams.moe_external_executor_layers = model.external_moe_executor_layers_data();
+    cparams.moe_external_executor_layer_count = model.external_moe_executor_layers_count();
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;

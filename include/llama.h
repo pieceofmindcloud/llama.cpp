@@ -357,6 +357,12 @@ extern "C" {
         // Do not allocate routed MoE expert tensors in llama.cpp. The external
         // executor receives their metadata and owns their storage instead.
         bool moe_external_executor;
+        // Optional per-layer ownership. A non-empty list makes ownership
+        // data-driven: 1 externalizes that layer, 0 keeps its native expert
+        // tensors and graph. The pointed-to storage is copied by the model
+        // during loading.
+        const uint8_t * moe_external_executor_layers;
+        size_t moe_external_executor_layer_count;
     };
 
     struct llama_sampler_seq_config {

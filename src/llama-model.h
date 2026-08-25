@@ -866,6 +866,10 @@ struct llama_model {
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
+    // The per-layer ownership list is copied from the public load parameters
+    // so its caller-owned storage may be released after model loading.
+    std::vector<uint8_t> external_moe_executor_layers;
+
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 
@@ -903,6 +907,12 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     bool uses_external_moe_executor() const;
+
+    bool uses_external_moe_executor_layer(int il) const;
+
+    const uint8_t * external_moe_executor_layers_data() const;
+
+    size_t external_moe_executor_layers_count() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

@@ -83,6 +83,8 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
     bool moe_external_executor;
+    const uint8_t * moe_external_executor_layers;
+    size_t moe_external_executor_layer_count;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
@@ -185,6 +187,8 @@ struct llama_model_loader {
         bool no_alloc,
         bool load_mtp,
         bool moe_external_executor,
+        const uint8_t * moe_external_executor_layers,
+        size_t moe_external_executor_layer_count,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
 

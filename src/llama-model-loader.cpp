@@ -544,10 +544,14 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         bool load_mtp,
         bool moe_external_executor,
+        const uint8_t * moe_external_executor_layers,
+        size_t moe_external_executor_layer_count,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     this->moe_external_executor = moe_external_executor;
+    this->moe_external_executor_layers = moe_external_executor_layers;
+    this->moe_external_executor_layer_count = moe_external_executor_layer_count;
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -1138,6 +1142,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     const auto is_external_moe_tensor = [&]() {
         if (!moe_external_executor) {
             return false;
+        }
+
+        if (moe_external_executor_layers != nullptr && tn.bid >= 0) {
+            if (static_cast<size_t>(tn.bid) >= moe_external_executor_layer_count ||
+                    moe_external_executor_layers[tn.bid] == 0) {
+                return false;
+            }
         }
 
         switch (tn.tensor) {
