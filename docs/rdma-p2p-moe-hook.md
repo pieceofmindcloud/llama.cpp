@@ -26,6 +26,43 @@ the upstream native path exactly. Dense models never install the callback and
 therefore retain the native dense path. Attention, normalization, embeddings,
 KV cache, tokenization, and sampling remain in llama.cpp in both modes.
 
+The route tensors are normalized by `llama_moe_reshape_route_2d` before the
+callback node is built. Top-k and gather operations may return a valid
+non-contiguous view, while `ggml_reshape_2d` requires a contiguous source. The
+helper calls `ggml_cont` only for that case, so the ordinary contiguous route
+does not copy. `tests/test-moe-route-layout.cpp` covers both layouts and keeps
+the non-contiguous case from becoming an assertion in the native graph.
+
+## F5-E2: metadata-only routed expert loading
+
+`llama_model_params::moe_external_executor` is the second, independent opt-in.
+When it is false, the loader and model buffers are unchanged. When it is true,
+the common loader classifies routed expert tensors by the generic
+`llm_tensor` semantic (`FFN_*_EXP`, `FFN_*_EXPS`, and the grouped expert
+variants), regardless of architecture or GGML dtype. Those tensors are created
+in a `no_alloc` metadata context and retain their GGUF name, rank, shape and
+dtype, but they are not put in a backend buffer and `load_all_data` never reads
+their payload into llama.cpp. The context is owned by `llama_model` only to
+keep the descriptor metadata alive.
+
+The routed expert bytes remain the responsibility of the Rust `MoeRuntime` and
+its local cache. Shared-expert tensors (`FFN_*_SHEXP`) are intentionally not
+classified as routed tensors: the common graph still executes those native
+shared experts, and the current callback descriptor does not replace them.
+This boundary is explicit rather than silently dropping a computation. A
+future hook that takes ownership of shared experts must add their metadata and
+execution contract before extending the classifier.
+
+The external metadata context is not part of `llama_model`'s backend-buffer
+map, so model memory breakdowns cannot report it as CUDA, CUDA_Host, or CPU
+weight residency. The loader also excludes those names from its load-progress
+byte total, so the final progress callback still reaches 100% even though
+their GGUF records are intentionally not read. The opt-in is propagated from `EngineConfig` and is part of
+the Rust `ModelCache` identity; a dense/native load and a metadata-only load of
+the same GGUF can never share a cached `llama_model`. At runtime, an external
+model without an installed callback is rejected at the decode boundary instead
+of falling back to native experts.
+
 The extension is intentionally kept at the common graph boundary so future
 upstream changes can be reviewed against one point. Changes in model-specific
 tensor conventions belong in the descriptor and in the external executor,

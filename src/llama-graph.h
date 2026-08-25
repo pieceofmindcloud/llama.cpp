@@ -38,6 +38,16 @@ class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
+// Route tensors are graph results, not model weights. Their layout may be a
+// view or another non-contiguous result of top-k/gather operations. Normalize
+// only that exceptional layout before ggml_reshape_2d, which requires a
+// contiguous source. Contiguous tensors are passed through without a copy.
+ggml_tensor * llama_moe_reshape_route_2d(
+        ggml_context * ctx,
+        ggml_tensor * tensor,
+        int64_t       ne0,
+        int64_t       ne1);
+
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,

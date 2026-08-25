@@ -27,6 +27,24 @@
 #include <string>
 #include <unordered_set>
 
+ggml_tensor * llama_moe_reshape_route_2d(
+        ggml_context * ctx,
+        ggml_tensor * tensor,
+        int64_t       ne0,
+        int64_t       ne1) {
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(tensor != nullptr);
+
+    // ggml_reshape_2d cannot consume a view with a row stride larger than its
+    // logical width. The route may legitimately have that layout after top-k
+    // or gather. Keep the common contiguous case zero-copy and materialize
+    // only when the graph actually requires it.
+    if (!ggml_is_contiguous(tensor)) {
+        tensor = ggml_cont(ctx, tensor);
+    }
+    return ggml_reshape_2d(ctx, tensor, ne0, ne1);
+}
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -2269,7 +2287,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_external(
         llama_expert_gating_func_type gating_op,
         bool          weight_before_ffn,
         int           il) const {
-    if (context == nullptr || cparams.cb_moe_ffn == nullptr) {
+    if (context == nullptr || (!cparams.moe_external_executor && cparams.cb_moe_ffn == nullptr)) {
         return nullptr;
     }
 
@@ -2529,13 +2547,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // exact expert ids and weights that native llama.cpp would use. Returning
     // immediately is essential: no native expert matmul is added to the
     // graph when the opt-in callback is installed.
-    if (cparams.cb_moe_ffn != nullptr) {
-        ggml_tensor * selected_for_external = ggml_cont(
-            ctx0,
-            ggml_reshape_2d(ctx0, selected_experts, n_expert_used, n_tokens));
-        ggml_tensor * weights_for_external = ggml_cont(
-            ctx0,
-            ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens));
+    if (cparams.moe_external_executor || cparams.cb_moe_ffn != nullptr) {
+        ggml_tensor * selected_for_external = llama_moe_reshape_route_2d(
+            ctx0, selected_experts, n_expert_used, n_tokens);
+        ggml_tensor * weights_for_external = llama_moe_reshape_route_2d(
+            ctx0, weights, n_expert_used, n_tokens);
         return build_moe_ffn_external(
             cur,
             selected_for_external,

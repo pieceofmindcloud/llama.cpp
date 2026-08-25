@@ -210,6 +210,7 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.moe_external_executor  = model.uses_external_moe_executor();
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -1360,6 +1361,9 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
 void llama_context::set_moe_ffn_callback(llama_moe_ffn_callback callback, void * userdata) {
     cparams.cb_moe_ffn = callback;
     cparams.cb_moe_ffn_user_data = userdata;
+    if (callback != nullptr && model.uses_external_moe_executor()) {
+        sched_need_reserve = true;
+    }
 }
 
 void llama_context::set_embeddings(bool value) {
@@ -1623,6 +1627,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    if (cparams.moe_external_executor && cparams.cb_moe_ffn == nullptr) {
+        LLAMA_LOG_ERROR("%s: external MoE executor is enabled but no callback is installed; refusing native expert fallback\n", __func__);
+        return -1;
+    }
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1862,6 +1871,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (cparams.moe_external_executor && cparams.cb_moe_ffn == nullptr) {
+        LLAMA_LOG_ERROR("%s: external MoE executor is enabled but no callback is installed; refusing native expert fallback\n", __func__);
+        return -1;
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);

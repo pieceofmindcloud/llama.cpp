@@ -543,9 +543,11 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         bool no_alloc,
         bool load_mtp,
+        bool moe_external_executor,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+    this->moe_external_executor = moe_external_executor;
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -839,6 +841,10 @@ llama_model_loader::llama_model_loader(
     this->load_mtp = load_mtp;
 }
 
+ggml_context_ptr llama_model_loader::take_external_moe_context() {
+    return std::move(external_moe_ctx);
+}
+
 std::string llama_model_loader::get_arch_name() const {
     return arch_name;
 }
@@ -1129,6 +1135,49 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
+    const auto is_external_moe_tensor = [&]() {
+        if (!moe_external_executor) {
+            return false;
+        }
+
+        switch (tn.tensor) {
+            case LLM_TENSOR_FFN_DOWN_EXP:
+            case LLM_TENSOR_FFN_GATE_EXP:
+            case LLM_TENSOR_FFN_UP_EXP:
+            case LLM_TENSOR_FFN_DOWN_EXPS:
+            case LLM_TENSOR_FFN_GATE_EXPS:
+            case LLM_TENSOR_FFN_UP_EXPS:
+            case LLM_TENSOR_FFN_GATE_UP_EXPS:
+            case LLM_TENSOR_FFN_DOWN_CHEXPS:
+            case LLM_TENSOR_FFN_GATE_CHEXPS:
+            case LLM_TENSOR_FFN_UP_CHEXPS:
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    const auto create_external_metadata_tensor = [&](const ggml_tensor & t_meta) {
+        if (!external_moe_ctx) {
+            const size_t ctx_size = ggml_tensor_overhead() * (static_cast<size_t>(n_tensors) + 1);
+            ggml_init_params params = {
+                /*.mem_size   =*/ ctx_size,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            external_moe_ctx.reset(ggml_init(params));
+            if (!external_moe_ctx) {
+                throw std::runtime_error("failed to create metadata context for external MoE tensors");
+            }
+        }
+
+        ggml_tensor * ret = ggml_dup_tensor(external_moe_ctx.get(), &t_meta);
+        ggml_set_name(ret, t_meta.name);
+        external_moe_tensor_names.emplace(t_meta.name);
+        n_created++;
+        return ret;
+    };
+
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };
 
@@ -1335,6 +1384,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_set_name(&t_meta, tn.str().c_str());
 
+        if (is_external_moe_tensor()) {
+            return create_external_metadata_tensor(t_meta);
+        }
+
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
         ggml_context * ctx = ctx_for_buft(buft);
@@ -1369,6 +1422,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
+
+    if (is_external_moe_tensor()) {
+        return create_external_metadata_tensor(t_meta);
+    }
 
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
@@ -1452,6 +1509,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
+        if (external_moe_tensor_names.count(it.first) != 0) {
+            continue;
+        }
         size_data += ggml_nbytes(it.second.tensor);
     }
 }

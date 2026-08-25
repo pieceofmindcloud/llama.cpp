@@ -354,6 +354,9 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        // Do not allocate routed MoE expert tensors in llama.cpp. The external
+        // executor receives their metadata and owns their storage instead.
+        bool moe_external_executor;
     };
 
     struct llama_sampler_seq_config {

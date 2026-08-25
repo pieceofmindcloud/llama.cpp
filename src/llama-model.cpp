@@ -1281,6 +1281,10 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // Metadata-only contexts for routed MoE tensors owned by an external
+    // executor. They deliberately have no backend buffers.
+    std::vector<ggml_context_ptr> external_moe_contexts;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1900,6 +1904,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
+    }
+    if (auto external_ctx = ml.take_external_moe_context()) {
+        for (auto * cur = ggml_get_first_tensor(external_ctx.get()); cur != NULL; cur = ggml_get_next_tensor(external_ctx.get(), cur)) {
+            tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+        }
+        pimpl->external_moe_contexts.emplace_back(std::move(external_ctx));
     }
 
     // per-tensor activation precision policy
@@ -2763,6 +2773,10 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+bool llama_model::uses_external_moe_executor() const {
+    return params.moe_external_executor;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -3395,6 +3409,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.moe_external_executor       =*/ false,
     };
 
     return result;
