@@ -363,6 +363,67 @@ extern "C" {
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
+    // A tensor passed to the generic opt-in MoE replacement hook. The
+    // descriptor is copied into the graph context, so its fixed-size strings
+    // remain valid until the callback runs.
+    typedef struct llama_moe_tensor_descriptor {
+        uint32_t present;
+        int32_t  dtype;
+        uint32_t n_dims;
+        int64_t  ne[4];
+        char     name[128];
+    } llama_moe_tensor_descriptor;
+
+    // All model-dependent MoE information is data in this descriptor. The
+    // callback must not infer a model architecture or quantization convention
+    // from a hard-coded branch.
+    typedef struct llama_moe_ffn_descriptor {
+        char     architecture[64];
+        int32_t  layer;
+        int32_t  activation;
+        int32_t  gating;
+        uint32_t normalize_weights;
+        uint32_t weight_before_ffn;
+        float    weight_scale;
+        uint64_t expert_count;
+        uint64_t expert_count_used;
+        llama_moe_tensor_descriptor gate_up;
+        llama_moe_tensor_descriptor gate;
+        llama_moe_tensor_descriptor up;
+        llama_moe_tensor_descriptor down;
+        llama_moe_tensor_descriptor gate_up_bias;
+        llama_moe_tensor_descriptor gate_bias;
+        llama_moe_tensor_descriptor up_bias;
+        llama_moe_tensor_descriptor down_bias;
+        llama_moe_tensor_descriptor gate_scale;
+        llama_moe_tensor_descriptor up_scale;
+        llama_moe_tensor_descriptor down_scale;
+    } llama_moe_ffn_descriptor;
+
+    // Callback used by an opt-in model graph to replace one generic MoE FFN
+    // while keeping attention, normalization, KV cache and the rest of the
+    // graph in llama.cpp. The callback receives routing already resolved by
+    // the common graph builder: selected_experts is [expert_count_used,
+    // n_tokens] I32 and weights is [expert_count_used, n_tokens] F32.
+    // It must write `hidden_width * n_tokens` F32 values to output and return
+    // true on success.
+    typedef bool (*llama_moe_ffn_callback)(
+            void * userdata,
+            const llama_moe_ffn_descriptor * descriptor,
+            const float * hidden,
+            const int32_t * selected_experts,
+            const float * weights,
+            size_t n_tokens,
+            size_t hidden_width,
+            float * output);
+
+    // Installs the opt-in generic MoE replacement callback for this context.
+    // Passing nullptr restores the native llama.cpp expert path.
+    LLAMA_API void llama_set_moe_ffn_callback(
+            struct llama_context * ctx,
+            llama_moe_ffn_callback callback,
+            void * userdata);
+
     struct llama_context_params {
         uint32_t n_ctx;                 // text context, 0 = from model
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode

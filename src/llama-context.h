@@ -63,6 +63,9 @@ struct llama_context {
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
+    void set_moe_ffn_descriptor(const llama_moe_ffn_descriptor & descriptor) const;
+    const llama_moe_ffn_descriptor * get_moe_ffn_descriptor(int32_t layer) const;
+
     ggml_backend_sched_t get_sched() const;
 
     uint32_t n_ctx()     const;
@@ -116,6 +119,8 @@ struct llama_context {
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
+
+    void set_moe_ffn_callback(llama_moe_ffn_callback callback, void * userdata);
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
@@ -416,6 +421,10 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // Descriptors for generic MoE replacement nodes. They contain graph
+    // metadata, not architecture-specific control flow.
+    mutable std::vector<llama_moe_ffn_descriptor> moe_ffn_descriptors;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

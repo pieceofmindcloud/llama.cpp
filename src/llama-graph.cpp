@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 
+#include "llama-context.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -19,6 +20,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -1546,6 +1548,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     arch             (params.arch),
     hparams          (params.hparams),
     cparams          (params.cparams),
+    context          (params.context),
     ubatch           (params.ubatch),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
@@ -2161,6 +2164,150 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+static void llama_moe_copy_string(char * dst, size_t dst_size, const char * src) {
+    if (dst_size == 0) {
+        return;
+    }
+    std::strncpy(dst, src == nullptr ? "" : src, dst_size - 1);
+    dst[dst_size - 1] = '\0';
+}
+
+static void llama_moe_describe_tensor(
+        llama_moe_tensor_descriptor * descriptor,
+        const ggml_tensor           * tensor) {
+    std::memset(descriptor, 0, sizeof(*descriptor));
+    if (tensor == nullptr) {
+        return;
+    }
+    descriptor->present = 1;
+    descriptor->dtype = static_cast<int32_t>(tensor->type);
+    descriptor->n_dims = static_cast<uint32_t>(ggml_n_dims(tensor));
+    for (uint32_t i = 0; i < GGML_MAX_DIMS; ++i) {
+        descriptor->ne[i] = tensor->ne[i];
+    }
+    llama_moe_copy_string(descriptor->name, sizeof(descriptor->name), ggml_get_name(tensor));
+}
+
+static int llama_moe_layer_from_name(const ggml_tensor * tensor) {
+    const char * name = tensor == nullptr ? nullptr : ggml_get_name(tensor);
+    const char * dash = name == nullptr ? nullptr : strrchr(name, '-');
+    char * end = nullptr;
+    const long layer = dash == nullptr ? -1 : std::strtol(dash + 1, &end, 10);
+    return dash != nullptr && end != dash + 1 && *end == '\0' && layer >= 0 && layer <= INT32_MAX
+        ? static_cast<int>(layer)
+        : -1;
+}
+
+static void llama_moe_ffn_custom(
+        ggml_tensor       * dst,
+        const ggml_tensor * hidden,
+        const ggml_tensor * selected_experts,
+        const ggml_tensor * weights,
+        int                 ith,
+        int                 nth,
+        void              * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+
+    auto * ctx = static_cast<const llama_context *>(userdata);
+    const auto & cparams = ctx->get_cparams();
+    const int layer = llama_moe_layer_from_name(dst);
+    const auto * descriptor = ctx->get_moe_ffn_descriptor(layer);
+    const size_t hidden_width = hidden == nullptr ? 0 : static_cast<size_t>(hidden->ne[0]);
+    const size_t n_tokens = hidden == nullptr ? 0 : static_cast<size_t>(hidden->ne[1]);
+    const bool valid_shape = hidden != nullptr && selected_experts != nullptr && weights != nullptr &&
+        hidden->type == GGML_TYPE_F32 && selected_experts->type == GGML_TYPE_I32 &&
+        weights->type == GGML_TYPE_F32 && ggml_is_contiguous(hidden) &&
+        ggml_is_contiguous(selected_experts) && ggml_is_contiguous(weights) &&
+        selected_experts->ne[0] == static_cast<int64_t>(descriptor == nullptr ? 0 : descriptor->expert_count_used) &&
+        selected_experts->ne[1] == static_cast<int64_t>(n_tokens) &&
+        weights->ne[0] == selected_experts->ne[0] && weights->ne[1] == selected_experts->ne[1] &&
+        dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst);
+
+    bool ok = cparams.cb_moe_ffn != nullptr && valid_shape && descriptor != nullptr;
+    if (cparams.cb_moe_ffn != nullptr) {
+        ok = cparams.cb_moe_ffn(
+            cparams.cb_moe_ffn_user_data,
+            descriptor,
+            valid_shape ? static_cast<const float *>(hidden->data) : nullptr,
+            valid_shape ? static_cast<const int32_t *>(selected_experts->data) : nullptr,
+            valid_shape ? static_cast<const float *>(weights->data) : nullptr,
+            n_tokens,
+            hidden_width,
+            static_cast<float *>(dst->data));
+    }
+    if (!ok) {
+        // The Rust bridge records the explicit refusal. Zeroing prevents an
+        // uninitialized graph value from becoming a silent model response;
+        // llama_decode rejects the bridge error at the boundary.
+        std::memset(dst->data, 0, ggml_nbytes(dst));
+    }
+}
+
+ggml_tensor * llm_graph_context::build_moe_ffn_external(
+        ggml_tensor * cur,
+        ggml_tensor * selected_experts,
+        ggml_tensor * weights,
+        ggml_tensor * gate_up_exps,
+        ggml_tensor * gate_exps,
+        ggml_tensor * up_exps,
+        ggml_tensor * down_exps,
+        ggml_tensor * gate_up_exps_b,
+        ggml_tensor * gate_exps_b,
+        ggml_tensor * up_exps_b,
+        ggml_tensor * down_exps_b,
+        ggml_tensor * gate_exps_s,
+        ggml_tensor * up_exps_s,
+        ggml_tensor * down_exps_s,
+        int64_t       n_expert,
+        int64_t       n_expert_used,
+        llm_ffn_op_type type_op,
+        bool          norm_w,
+        float         w_scale,
+        llama_expert_gating_func_type gating_op,
+        bool          weight_before_ffn,
+        int           il) const {
+    if (context == nullptr || cparams.cb_moe_ffn == nullptr) {
+        return nullptr;
+    }
+
+    llama_moe_ffn_descriptor descriptor = {};
+    llama_moe_copy_string(descriptor.architecture, sizeof(descriptor.architecture), llm_arch_name(arch));
+    descriptor.layer = il;
+    descriptor.activation = static_cast<int32_t>(type_op);
+    descriptor.gating = static_cast<int32_t>(gating_op);
+    descriptor.normalize_weights = norm_w ? 1 : 0;
+    descriptor.weight_before_ffn = weight_before_ffn ? 1 : 0;
+    descriptor.weight_scale = w_scale;
+    descriptor.expert_count = static_cast<uint64_t>(n_expert);
+    descriptor.expert_count_used = static_cast<uint64_t>(n_expert_used);
+    llama_moe_describe_tensor(&descriptor.gate_up, gate_up_exps);
+    llama_moe_describe_tensor(&descriptor.gate, gate_exps);
+    llama_moe_describe_tensor(&descriptor.up, up_exps);
+    llama_moe_describe_tensor(&descriptor.down, down_exps);
+    llama_moe_describe_tensor(&descriptor.gate_up_bias, gate_up_exps_b);
+    llama_moe_describe_tensor(&descriptor.gate_bias, gate_exps_b);
+    llama_moe_describe_tensor(&descriptor.up_bias, up_exps_b);
+    llama_moe_describe_tensor(&descriptor.down_bias, down_exps_b);
+    llama_moe_describe_tensor(&descriptor.gate_scale, gate_exps_s);
+    llama_moe_describe_tensor(&descriptor.up_scale, up_exps_s);
+    llama_moe_describe_tensor(&descriptor.down_scale, down_exps_s);
+    context->set_moe_ffn_descriptor(descriptor);
+
+    auto * external = ggml_map_custom3(
+        ctx0,
+        cur,
+        selected_experts,
+        weights,
+        llama_moe_ffn_custom,
+        1,
+        const_cast<llama_context *>(context));
+    ggml_format_name(external, "ffn_moe_external-%d", il);
+    return external;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2375,6 +2522,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    // This is the single replacement point shared by model builders. The
+    // route is already resolved here, so the external executor receives the
+    // exact expert ids and weights that native llama.cpp would use. Returning
+    // immediately is essential: no native expert matmul is added to the
+    // graph when the opt-in callback is installed.
+    if (cparams.cb_moe_ffn != nullptr) {
+        ggml_tensor * selected_for_external = ggml_cont(
+            ctx0,
+            ggml_reshape_2d(ctx0, selected_experts, n_expert_used, n_tokens));
+        ggml_tensor * weights_for_external = ggml_cont(
+            ctx0,
+            ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens));
+        return build_moe_ffn_external(
+            cur,
+            selected_for_external,
+            weights_for_external,
+            gate_up_exps,
+            gate_exps,
+            up_exps,
+            down_exps,
+            gate_up_exps_b,
+            gate_exps_b,
+            up_exps_b,
+            down_exps_b,
+            gate_exps_s,
+            up_exps_s,
+            down_exps_s,
+            n_expert,
+            n_expert_used,
+            type_op,
+            norm_w,
+            w_scale,
+            gating_op,
+            weight_before_ffn,
+            il);
     }
 
     //call early so that topk-moe can be used

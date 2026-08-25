@@ -927,6 +927,26 @@ const llama_cparams & llama_context::get_cparams() const {
     return cparams;
 }
 
+void llama_context::set_moe_ffn_descriptor(
+        const llama_moe_ffn_descriptor & descriptor) const {
+    if (descriptor.layer < 0) {
+        return;
+    }
+    const size_t layer = static_cast<size_t>(descriptor.layer);
+    if (moe_ffn_descriptors.size() <= layer) {
+        moe_ffn_descriptors.resize(layer + 1);
+    }
+    moe_ffn_descriptors[layer] = descriptor;
+}
+
+const llama_moe_ffn_descriptor * llama_context::get_moe_ffn_descriptor(
+        int32_t layer) const {
+    if (layer < 0 || static_cast<size_t>(layer) >= moe_ffn_descriptors.size()) {
+        return nullptr;
+    }
+    return &moe_ffn_descriptors[static_cast<size_t>(layer)];
+}
+
 ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
@@ -1335,6 +1355,11 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
             }
         }
     }
+}
+
+void llama_context::set_moe_ffn_callback(llama_moe_ffn_callback callback, void * userdata) {
+    cparams.cb_moe_ffn = callback;
+    cparams.cb_moe_ffn_user_data = userdata;
 }
 
 void llama_context::set_embeddings(bool value) {
@@ -2710,6 +2735,7 @@ llm_graph_params llama_context::graph_params(
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
+        /*.context     =*/ this,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
@@ -4212,6 +4238,16 @@ int32_t llama_n_threads_batch(llama_context * ctx) {
 
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->set_abort_callback(abort_callback, abort_callback_data);
+}
+
+void llama_set_moe_ffn_callback(
+        llama_context * ctx,
+        llama_moe_ffn_callback callback,
+        void * userdata) {
+    if (ctx == nullptr) {
+        return;
+    }
+    ctx->set_moe_ffn_callback(callback, userdata);
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
