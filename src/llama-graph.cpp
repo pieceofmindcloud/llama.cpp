@@ -35,13 +35,12 @@ ggml_tensor * llama_moe_reshape_route_2d(
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(tensor != nullptr);
 
-    // ggml_reshape_2d cannot consume a view with a row stride larger than its
-    // logical width. The route may legitimately have that layout after top-k
-    // or gather. Keep the common contiguous case zero-copy and materialize
-    // only when the graph actually requires it.
-    if (!ggml_is_contiguous(tensor)) {
-        tensor = ggml_cont(ctx, tensor);
-    }
+    // The route crosses from the backend that computes top-k/gather to the
+    // CPU custom op. A stride check is not enough here: a tensor can describe
+    // a contiguous layout while its producer allocation has not been
+    // materialized for the scheduler copy yet. Force a concrete producer for
+    // every route, including the first token/slot, before reshaping it.
+    tensor = ggml_cont(ctx, tensor);
     return ggml_reshape_2d(ctx, tensor, ne0, ne1);
 }
 

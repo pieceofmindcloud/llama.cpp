@@ -1,7 +1,7 @@
 #include "ggml.h"
 
-#include <cassert>
 #include <cstddef>
+#include <cstdio>
 
 struct ggml_context;
 struct ggml_tensor;
@@ -22,13 +22,26 @@ int main() {
         /*.no_alloc   =*/ true,
     };
     ggml_context * ctx = ggml_init(params);
-    assert(ctx != nullptr);
+    if (ctx == nullptr) {
+        return 1;
+    }
 
     ggml_tensor * base = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 8, 4);
     ggml_tensor * reshaped_contiguous = llama_moe_reshape_route_2d(ctx, base, 4, 8);
-    assert(ggml_is_contiguous(base));
-    assert(ggml_is_contiguous(reshaped_contiguous));
-    assert(reshaped_contiguous->src[0] == base);
+    if (!ggml_is_contiguous(base) || !ggml_is_contiguous(reshaped_contiguous)) {
+        std::fputs("route helper returned a non-contiguous tensor\n", stderr);
+        return 1;
+    }
+    // Route tensors cross from the backend that computes top-k/gather to the
+    // CPU custom op. Even a tensor whose strides look contiguous must have a
+    // concrete producer so that scheduler copies cannot observe an
+    // uninitialized allocation on the first route element.
+    if (reshaped_contiguous->src[0] == base ||
+        reshaped_contiguous->src[0]->op != GGML_OP_CONT ||
+        reshaped_contiguous->src[0]->src[0] != base) {
+        std::fputs("route helper did not materialize the contiguous route\n", stderr);
+        return 1;
+    }
 
     // A view with the source row stride is valid but not contiguous after
     // narrowing the first dimension. This is the layout produced by graph
@@ -40,15 +53,21 @@ int main() {
         4,
         base->nb[1],
         0);
-    assert(!ggml_is_contiguous(non_contiguous));
+    if (ggml_is_contiguous(non_contiguous)) {
+        std::fputs("test view unexpectedly contiguous\n", stderr);
+        return 1;
+    }
 
     ggml_tensor * reshaped_non_contiguous =
         llama_moe_reshape_route_2d(ctx, non_contiguous, 4, 4);
-    assert(ggml_is_contiguous(reshaped_non_contiguous));
-    assert(reshaped_non_contiguous->ne[0] == 4);
-    assert(reshaped_non_contiguous->ne[1] == 4);
-    assert(reshaped_non_contiguous->src[0] != non_contiguous);
-    assert(ggml_is_contiguous(reshaped_non_contiguous->src[0]));
+    if (!ggml_is_contiguous(reshaped_non_contiguous) ||
+        reshaped_non_contiguous->ne[0] != 4 ||
+        reshaped_non_contiguous->ne[1] != 4 ||
+        reshaped_non_contiguous->src[0] == non_contiguous ||
+        !ggml_is_contiguous(reshaped_non_contiguous->src[0])) {
+        std::fputs("route helper failed to materialize the strided route\n", stderr);
+        return 1;
+    }
 
     ggml_free(ctx);
     return 0;
