@@ -18,6 +18,8 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <atomic>
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -2215,6 +2217,84 @@ static int llama_moe_layer_from_name(const ggml_tensor * tensor) {
         : -1;
 }
 
+static bool llama_moe_route_trace_enabled() {
+    static const bool enabled = [] {
+        const char * raw = std::getenv("POM_MOE_ROUTE_COPY_TRACE");
+        return raw != nullptr && (
+            std::strcmp(raw, "1") == 0 ||
+            std::strcmp(raw, "true") == 0 ||
+            std::strcmp(raw, "yes") == 0 ||
+            std::strcmp(raw, "on") == 0);
+    }();
+    return enabled;
+}
+
+bool llama_moe_route_trace_first_layer_name(const char * name) {
+    return name != nullptr &&
+        (std::strstr(name, "ffn_moe_topk-0") != nullptr ||
+         std::strstr(name, "ffn_moe_weights-0") != nullptr);
+}
+
+static void llama_moe_trace_callback_route(
+        int                 layer,
+        const ggml_tensor * dst,
+        const ggml_tensor * selected_experts,
+        const ggml_tensor * weights) {
+    if (!llama_moe_route_trace_enabled() || layer != 0) {
+        return;
+    }
+
+    static std::atomic<bool> emitted = false;
+    if (emitted.exchange(true)) {
+        return;
+    }
+
+    const char * dst_name = dst == nullptr ? "<null>" : ggml_get_name(dst);
+    const char * selected_name = selected_experts == nullptr ? "<null>" : ggml_get_name(selected_experts);
+    const char * weights_name = weights == nullptr ? "<null>" : ggml_get_name(weights);
+    if (selected_experts == nullptr || weights == nullptr ||
+            selected_experts->data == nullptr || weights->data == nullptr ||
+            selected_experts->type != GGML_TYPE_I32 || weights->type != GGML_TYPE_F32) {
+        LLAMA_LOG_WARN(
+            "POM_MOE_ROUTE_COPY_TRACE callback layer=%d dst=%s selected_src=%s selected_ptr=%p selected_values=<unavailable> weights_src=%s weights_ptr=%p weights_values=<unavailable>\n",
+            layer,
+            dst_name,
+            selected_name,
+            selected_experts == nullptr ? nullptr : selected_experts->data,
+            weights_name,
+            weights == nullptr ? nullptr : weights->data);
+        return;
+    }
+
+    const size_t selected_count = std::min<size_t>(4, static_cast<size_t>(ggml_nelements(selected_experts)));
+    const size_t weights_count = std::min<size_t>(4, static_cast<size_t>(ggml_nelements(weights)));
+    std::ostringstream selected_values;
+    std::ostringstream weights_values;
+    for (size_t i = 0; i < selected_count; ++i) {
+        if (i != 0) {
+            selected_values << ',';
+        }
+        selected_values << static_cast<const int32_t *>(selected_experts->data)[i];
+    }
+    for (size_t i = 0; i < weights_count; ++i) {
+        if (i != 0) {
+            weights_values << ',';
+        }
+        weights_values << static_cast<const float *>(weights->data)[i];
+    }
+
+    LLAMA_LOG_WARN(
+        "POM_MOE_ROUTE_COPY_TRACE callback layer=%d dst=%s selected_src=%s selected_ptr=%p selected_values=[%s] weights_src=%s weights_ptr=%p weights_values=[%s]\n",
+        layer,
+        dst_name,
+        selected_name,
+        selected_experts->data,
+        selected_values.str().c_str(),
+        weights_name,
+        weights->data,
+        weights_values.str().c_str());
+}
+
 static void llama_moe_ffn_custom(
         ggml_tensor       * dst,
         const ggml_tensor * hidden,
@@ -2231,6 +2311,7 @@ static void llama_moe_ffn_custom(
     auto * ctx = static_cast<const llama_context *>(userdata);
     const auto & cparams = ctx->get_cparams();
     const int layer = llama_moe_layer_from_name(dst);
+    llama_moe_trace_callback_route(layer, dst, selected_experts, weights);
     const auto * descriptor = ctx->get_moe_ffn_descriptor(layer);
     const size_t hidden_width = hidden == nullptr ? 0 : static_cast<size_t>(hidden->ne[0]);
     const size_t n_tokens = hidden == nullptr ? 0 : static_cast<size_t>(hidden->ne[1]);
