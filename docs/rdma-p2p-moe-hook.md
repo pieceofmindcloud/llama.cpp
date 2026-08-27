@@ -29,9 +29,22 @@ KV cache, tokenization, and sampling remain in llama.cpp in both modes.
 The route tensors are normalized by `llama_moe_reshape_route_2d` before the
 callback node is built. Top-k and gather operations may return a valid
 non-contiguous view, while `ggml_reshape_2d` requires a contiguous source. The
-helper calls `ggml_cont` only for that case, so the ordinary contiguous route
-does not copy. `tests/test-moe-route-layout.cpp` covers both layouts and keeps
-the non-contiguous case from becoming an assertion in the native graph.
+helper therefore calls `ggml_cont` for every route, including a tensor whose
+strides look contiguous. The callback is a CPU custom op and needs a concrete
+producer so the scheduler can materialize the route before the backend
+boundary; logical contiguity alone is not that guarantee. The test covers both
+layouts and asserts that both produce a `GGML_OP_CONT` node.
+
+This materialization adds one concrete route operation for the selected expert
+IDs and one for their weights per externally executed layer. The current test
+and local CPU build validate the graph contract, but they do not measure a
+representative CUDA inference. The cost must therefore be measured on the
+deployment hardware before tuning this boundary.
+
+Gemma 4 remains an open validation question. Its router-logit construction is
+different, but its external route still reaches this common materialization and
+CPU callback path. No Gemma diagnostic execution has established that it
+escapes the failure or that it is safe when the external executor is enabled.
 
 ## F5-E2: metadata-only routed expert loading
 
