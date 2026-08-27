@@ -250,7 +250,7 @@ extern "C" {
     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
     //
     // - token  : the token ids of the input (used when embd is NULL)
-    // - embd   : token embeddings (i.e. float vector of size n_embd) (used when token is NULL)
+    // - embd   : token embeddings (i.e. float vectors with n_embd values per row) (used when token is NULL)
     // - pos    : the positions of the respective token in the sequence
     //            (if set to NULL, the token position will be tracked automatically by llama_encode/llama_decode)
     // - seq_id : the sequence to which the respective token belongs
@@ -270,6 +270,10 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+
+        // Number of float values in each row pointed to by embd. A zero value
+        // keeps the legacy behavior for manually assembled batches.
+        int32_t          n_embd;
     } llama_batch;
 
     enum llama_model_kv_override_type {
@@ -1040,6 +1044,7 @@ extern "C" {
     // Each token can be assigned up to n_seq_max sequence ids
     // The batch has to be freed with llama_batch_free()
     // If embd != 0, llama_batch.embd will be allocated with size of n_tokens * embd * sizeof(float)
+    // and llama_batch.n_embd will be set to embd.
     // Otherwise, llama_batch.token will be allocated to store n_tokens llama_token
     // The rest of the llama_batch members are allocated with size n_tokens
     // All members are left uninitialized

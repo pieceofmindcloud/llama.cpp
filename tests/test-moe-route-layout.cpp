@@ -1,4 +1,8 @@
 #include "ggml.h"
+#include "llama.h"
+
+#include "../src/llama-batch.h"
+#include "../src/llama-vocab.h"
 
 #include <cassert>
 #include <cstddef>
@@ -18,7 +22,59 @@ ggml_tensor * llama_moe_reshape_route_2d(
 
 bool llama_moe_route_trace_layer_name(const char * name, int layer);
 
+static bool test_embedding_width_reaches_allocator() {
+    constexpr int32_t n_tokens = 11;
+    constexpr int32_t n_embd = 4096;
+    constexpr int32_t flow_count = 4;
+
+    for (const int32_t input_width : { n_embd, n_embd * flow_count }) {
+        llama_batch batch = llama_batch_init(n_tokens, input_width, 1);
+        if (batch.embd == nullptr || batch.n_embd != input_width) {
+            return false;
+        }
+        batch.n_tokens = n_tokens;
+
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            batch.pos[i] = i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i] = 1;
+            batch.embd[(size_t) i * input_width] = 100.0f + i;
+            batch.embd[(size_t) i * input_width + input_width - 1] = 200.0f + i;
+        }
+
+        // the decoder width is n_embd, the row width comes from llama_batch.n_embd
+        llama_batch_ext batch_ext(n_tokens, n_embd, n_embd, 1, nullptr, 100, 1);
+        llama_batch_compat::init(batch_ext, batch, batch.n_embd);
+
+        llama_vocab vocab;
+        llama_batch_allocr allocator(1);
+        if (!allocator.init(batch_ext, vocab, false)) {
+            llama_batch_free(batch);
+            return false;
+        }
+
+        allocator.split_reset();
+        const llama_ubatch ubatch = allocator.split_simple(n_tokens);
+        if (ubatch.n_embd != (uint32_t) input_width ||
+                ubatch.embd == nullptr ||
+                ubatch.embd[input_width - 1] != 200.0f ||
+                ubatch.embd[(size_t) (n_tokens - 1) * input_width] != 100.0f + n_tokens - 1) {
+            llama_batch_free(batch);
+            return false;
+        }
+
+        llama_batch_free(batch);
+    }
+
+    return true;
+}
+
 int main() {
+    if (!test_embedding_width_reaches_allocator()) {
+        return 1;
+    }
+
     assert(llama_moe_route_trace_layer_name("ffn_moe_topk-0", 0));
     assert(llama_moe_route_trace_layer_name("ffn_moe_weights-0 (reshaped)", 0));
     assert(llama_moe_route_trace_layer_name("ffn_moe_topk-1 (cont) (reshaped)", 1));

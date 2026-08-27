@@ -1888,9 +1888,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
-    if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
-        LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
-                __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
+    // an expanded hidden state (n_embd_out wide, e.g. the hc streams) is also accepted as input
+    const size_t n_embd_out = model.hparams.n_embd_out();
+    const bool expanded_input_width = batch_inp.n_embd == n_embd_out &&
+            n_embd_out > batch_inp.n_embd_inp && n_embd_out % model.hparams.n_embd == 0;
+
+    if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp && !expanded_input_width) {
+        LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu or the expanded width %zu\n",
+                __func__, batch_inp.n_embd, batch_inp.n_embd_inp, n_embd_out);
         return -1;
     }
 
@@ -4697,7 +4702,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    llama_batch_compat compat(this, batch_inp);
+    // embd rows may be wider than the decoder input, see llama_batch.n_embd
+    const size_t n_embd_row = batch_inp.embd && !batch_inp.token && batch_inp.n_embd > 0 ? (size_t) batch_inp.n_embd : 0;
+    llama_batch_compat compat(this, batch_inp, n_embd_row);
     return decode(*compat.batch_ext);
 }
 
