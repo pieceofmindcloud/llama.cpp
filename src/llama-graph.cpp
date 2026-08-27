@@ -2217,22 +2217,53 @@ static int llama_moe_layer_from_name(const ggml_tensor * tensor) {
         : -1;
 }
 
-static bool llama_moe_route_trace_enabled() {
-    static const bool enabled = [] {
+// POM_MOE_ROUTE_COPY_TRACE is intentionally the only switch for this trace.
+// The legacy value "1" means layer 0; use "layer=1" for layer 1 because the
+// legacy value and the layer number otherwise collide.
+static int llama_moe_route_trace_layer() {
+    static const int layer = [] {
         const char * raw = std::getenv("POM_MOE_ROUTE_COPY_TRACE");
-        return raw != nullptr && (
-            std::strcmp(raw, "1") == 0 ||
-            std::strcmp(raw, "true") == 0 ||
-            std::strcmp(raw, "yes") == 0 ||
-            std::strcmp(raw, "on") == 0);
+        if (raw == nullptr || *raw == '\0') {
+            return -1;
+        }
+        if (std::strcmp(raw, "1") == 0 || std::strcmp(raw, "true") == 0 ||
+                std::strcmp(raw, "yes") == 0 || std::strcmp(raw, "on") == 0) {
+            return 0;
+        }
+
+        const char * number = raw;
+        if (std::strncmp(raw, "layer=", 6) == 0 || std::strncmp(raw, "layer:", 6) == 0) {
+            number += 6;
+        }
+        char * end = nullptr;
+        const long value = std::strtol(number, &end, 10);
+        if (end == number || *end != '\0' || value < 0 || value > INT32_MAX) {
+            return -1;
+        }
+        return static_cast<int>(value);
     }();
-    return enabled;
+    return layer;
 }
 
-bool llama_moe_route_trace_first_layer_name(const char * name) {
-    return name != nullptr &&
-        (std::strstr(name, "ffn_moe_topk-0") != nullptr ||
-         std::strstr(name, "ffn_moe_weights-0") != nullptr);
+bool llama_moe_route_trace_layer_name(const char * name, int layer) {
+    if (name == nullptr || layer < 0) {
+        return false;
+    }
+
+    for (const char * prefix : {"ffn_moe_topk-", "ffn_moe_weights-"}) {
+        const char * match = std::strstr(name, prefix);
+        if (match == nullptr) {
+            continue;
+        }
+
+        char * end = nullptr;
+        const long parsed_layer = std::strtol(match + std::strlen(prefix), &end, 10);
+        if (end != match + std::strlen(prefix) && parsed_layer == layer &&
+                (*end == '\0' || *end == ' ' || *end == '(')) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void llama_moe_trace_callback_route(
@@ -2240,7 +2271,7 @@ static void llama_moe_trace_callback_route(
         const ggml_tensor * dst,
         const ggml_tensor * selected_experts,
         const ggml_tensor * weights) {
-    if (!llama_moe_route_trace_enabled() || layer != 0) {
+    if (layer < 0 || layer != llama_moe_route_trace_layer()) {
         return;
     }
 

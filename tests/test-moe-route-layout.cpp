@@ -1,5 +1,6 @@
 #include "ggml.h"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdio>
 
@@ -15,14 +16,15 @@ ggml_tensor * llama_moe_reshape_route_2d(
         int64_t       ne0,
         int64_t       ne1);
 
-bool llama_moe_route_trace_first_layer_name(const char * name);
+bool llama_moe_route_trace_layer_name(const char * name, int layer);
 
 int main() {
-    assert(llama_moe_route_trace_first_layer_name("ffn_moe_topk-0"));
-    assert(llama_moe_route_trace_first_layer_name("ffn_moe_weights-0 (reshaped)"));
-    assert(!llama_moe_route_trace_first_layer_name("ffn_moe_topk-1"));
-    assert(!llama_moe_route_trace_first_layer_name("unrelated-0"));
-    assert(!llama_moe_route_trace_first_layer_name(nullptr));
+    assert(llama_moe_route_trace_layer_name("ffn_moe_topk-0", 0));
+    assert(llama_moe_route_trace_layer_name("ffn_moe_weights-0 (reshaped)", 0));
+    assert(llama_moe_route_trace_layer_name("ffn_moe_topk-1 (cont) (reshaped)", 1));
+    assert(!llama_moe_route_trace_layer_name("ffn_moe_topk-1", 0));
+    assert(!llama_moe_route_trace_layer_name("unrelated-0", 0));
+    assert(!llama_moe_route_trace_layer_name(nullptr, 0));
 
     ggml_init_params params = {
         /*.mem_size   =*/ 1024 * 1024,

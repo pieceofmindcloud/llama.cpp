@@ -90,3 +90,20 @@ The extension is intentionally kept at the common graph boundary so future
 upstream changes can be reviewed against one point. Changes in model-specific
 tensor conventions belong in the descriptor and in the external executor,
 not in `arch == ...` branches in this fork.
+
+## Route-copy trace
+
+The optional boundary trace is controlled only by `POM_MOE_ROUTE_COPY_TRACE`.
+When the variable is absent, the trace is disabled and adds no synchronization,
+tensor reads, or log output. The legacy value `1` (and the boolean values
+`true`, `yes`, and `on`) selects layer 0. A decimal value selects that layer,
+with `0` selecting layer 0; because `1` is reserved for the legacy meaning,
+layer 1 is selected explicitly with `layer=1` (or `layer:1`). Invalid values
+disable the trace.
+
+For the selected layer, the scheduler logs at most four elements from the
+source and destination of one selected-expert copy and one weight copy. The
+callback logs at most four elements received in each route source, once. The
+trace synchronizes only while enabled and reads data without changing it; it
+does not alter numerical execution. This bounded sampling is intended for a
+single deployment diagnosis, not normal operation.

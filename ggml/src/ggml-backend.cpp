@@ -900,28 +900,50 @@ static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
 
-static bool ggml_backend_sched_route_trace_enabled() {
-    static const bool enabled = [] {
+static int ggml_backend_sched_route_trace_layer() {
+    static const int layer = [] {
         const char * raw = getenv("POM_MOE_ROUTE_COPY_TRACE");
-        return raw != nullptr && (
-            strcmp(raw, "1") == 0 ||
-            strcmp(raw, "true") == 0 ||
-            strcmp(raw, "yes") == 0 ||
-            strcmp(raw, "on") == 0);
+        if (raw == nullptr || *raw == '\0') {
+            return -1;
+        }
+        if (strcmp(raw, "1") == 0 || strcmp(raw, "true") == 0 ||
+                strcmp(raw, "yes") == 0 || strcmp(raw, "on") == 0) {
+            return 0;
+        }
+
+        const char * number = raw;
+        if (strncmp(raw, "layer=", 6) == 0 || strncmp(raw, "layer:", 6) == 0) {
+            number += 6;
+        }
+        char * end = nullptr;
+        const long value = strtol(number, &end, 10);
+        if (end == number || *end != '\0' || value < 0 || value > INT_MAX) {
+            return -1;
+        }
+        return static_cast<int>(value);
     }();
-    return enabled;
+    return layer;
 }
 
-static const char * ggml_backend_sched_route_trace_role(const ggml_tensor * tensor) {
+static const char * ggml_backend_sched_route_trace_role(const ggml_tensor * tensor, int layer) {
     const char * name = tensor == nullptr ? nullptr : ggml_get_name(tensor);
     if (name == nullptr) {
         return nullptr;
     }
-    if (strstr(name, "ffn_moe_topk-0") != nullptr) {
-        return "selected";
-    }
-    if (strstr(name, "ffn_moe_weights-0") != nullptr) {
-        return "weights";
+
+    for (const char * prefix : {"ffn_moe_topk-", "ffn_moe_weights-"}) {
+        const char * match = strstr(name, prefix);
+        if (match == nullptr) {
+            continue;
+        }
+
+        char * end = nullptr;
+        const long parsed_layer = strtol(match + strlen(prefix), &end, 10);
+        if (end == match + strlen(prefix) || parsed_layer != layer ||
+                !(*end == '\0' || *end == ' ' || *end == '(')) {
+            continue;
+        }
+        return strcmp(prefix, "ffn_moe_topk-") == 0 ? "selected" : "weights";
     }
     return nullptr;
 }
@@ -935,11 +957,11 @@ static void ggml_backend_sched_trace_route_copy(
         ggml_backend_t       split_backend,
         const ggml_tensor  * input,
         const ggml_tensor  * input_cpy) {
-    if (!ggml_backend_sched_route_trace_enabled()) {
+    const int layer = ggml_backend_sched_route_trace_layer();
+    if (layer < 0) {
         return;
     }
-
-    const char * role = ggml_backend_sched_route_trace_role(input);
+    const char * role = ggml_backend_sched_route_trace_role(input, layer);
     if (role == nullptr || input == nullptr || input_cpy == nullptr) {
         return;
     }
@@ -967,7 +989,8 @@ static void ggml_backend_sched_trace_route_copy(
             input->type != input_cpy->type ||
             (input->type != GGML_TYPE_I32 && input->type != GGML_TYPE_F32)) {
         GGML_LOG_WARN(
-            "POM_MOE_ROUTE_COPY_TRACE copy role=%s src=%s src_ptr=%p src_backend=%s dst=%s dst_ptr=%p dst_backend=%s type=%s values=<unavailable>\n",
+            "POM_MOE_ROUTE_COPY_TRACE copy layer=%d role=%s src=%s src_ptr=%p src_backend=%s dst=%s dst_ptr=%p dst_backend=%s type=%s values=<unavailable>\n",
+            layer,
             role,
             src_name,
             input->data,
@@ -1011,7 +1034,8 @@ static void ggml_backend_sched_trace_route_copy(
     }
 
     GGML_LOG_WARN(
-        "POM_MOE_ROUTE_COPY_TRACE copy role=%s src=%s src_ptr=%p src_backend=%s src_values=[%s] dst=%s dst_ptr=%p dst_backend=%s dst_values=[%s]\n",
+        "POM_MOE_ROUTE_COPY_TRACE copy layer=%d role=%s src=%s src_ptr=%p src_backend=%s src_values=[%s] dst=%s dst_ptr=%p dst_backend=%s dst_values=[%s]\n",
+        layer,
         role,
         src_name,
         input->data,

@@ -48,9 +48,9 @@ ggml_tensor * llama_moe_reshape_route_2d(
         int64_t       ne0,
         int64_t       ne1);
 
-// Keep the route-copy trace scoped to the first MoE layer. This predicate is
-// exposed for the focused regression test; the trace itself remains opt-in.
-bool llama_moe_route_trace_first_layer_name(const char * name);
+// Keep the route-copy trace scoped to one selected MoE layer. This predicate
+// is exposed for the focused regression test; the trace itself remains opt-in.
+bool llama_moe_route_trace_layer_name(const char * name, int layer);
 
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
