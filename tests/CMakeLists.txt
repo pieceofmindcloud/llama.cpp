@@ -178,6 +178,7 @@ set(LLAMA_CONTEXT_TEST_SRC
     llama-context/test-util.cpp
 )
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
+llama_build_and_test(test-fit-memory.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
