@@ -179,6 +179,7 @@ set(LLAMA_CONTEXT_TEST_SRC
 )
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
 llama_build_and_test(test-fit-memory.cpp)
+llama_build(test-hybrid-memory-batch.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -271,6 +272,17 @@ llama_test(
 set_tests_properties(test-llama-context PROPERTIES
     FIXTURES_REQUIRED generate-models
     ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+)
+
+# hybrid (recurrent) memory with many long sequences and rollback
+llama_test(
+    test-hybrid-memory-batch
+    NAME test-hybrid-memory-batch-kimi-k3
+    LABEL main
+    ARGS -m "${MODEL_DIR}/kimi-k3-moe.gguf"
+)
+set_tests_properties(test-hybrid-memory-batch-kimi-k3 PROPERTIES
+    FIXTURES_REQUIRED generate-models
 )
 
 llama_build(test-fusion.cpp)
