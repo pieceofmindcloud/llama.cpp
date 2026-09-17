@@ -23,6 +23,20 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
     }
 }
 
+// Diagnostic-only: logs before a ggml_reshape_3d(ctx0, t, ne0, ne1, ne2) call
+// whenever t's actual element count doesn't match ne0*ne1*ne2, instead of
+// letting ggml.c's own GGML_ASSERT abort the whole process with no context.
+// Never changes control flow or the reshape itself.
+static void qwen4exp_check_reshape3d(const char * tag, const ggml_tensor * t, int64_t ne0, int64_t ne1, int64_t ne2) {
+    const int64_t actual   = ggml_nelements(t);
+    const int64_t expected = ne0 * ne1 * ne2;
+    if (actual != expected) {
+        LLAMA_LOG_ERROR("qwen4exp reshape3d mismatch [%s]: tensor has %" PRId64 " elements, "
+                "target %" PRId64 "x%" PRId64 "x%" PRId64 " = %" PRId64 "; tensor ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                tag, actual, ne0, ne1, ne2, expected, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+    }
+}
+
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -384,12 +398,15 @@ llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * mixed = nullptr;
     if (cparams.fused_dsv4_hc_pre && il >= 0) {
         // sigmoid gate and mean over the streams in one op
+        qwen4exp_check_reshape3d("hc_mix_xn",   xn,   n_embd, hc, nt);
+        qwen4exp_check_reshape3d("hc_mix_gate", gate, n_embd, hc, nt);
         mixed = ggml_dsv4_hc_pre_gated(ctx0,
                 ggml_reshape_3d(ctx0, xn,   n_embd, hc, nt),
                 ggml_reshape_3d(ctx0, gate, n_embd, hc, nt), 1.0f / (float) hc);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, mixed, il});
     } else {
         ggml_tensor * gated = ggml_mul(ctx0, xn, ggml_sigmoid(ctx0, gate));
+        qwen4exp_check_reshape3d("hc_mix_gated", gated, n_embd, hc, nt);
         gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
         // collapse the streams by their mean
@@ -432,8 +449,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
         cur = ggml_dsv4_hc_post(ctx0, block_out, residual, w, nullptr);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, cur, il});
     } else {
+        qwen4exp_check_reshape3d("hc_combine_w", w, 1, hc, nt);
         w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
+        qwen4exp_check_reshape3d("hc_combine_block_out", block_out, n_embd, 1, nt);
         ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
         b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
 
@@ -487,9 +506,18 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // the wide residual starts as hc identical copies of the embedding
-    ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
-            ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
-            n_embd, hc, n_tokens, 1);
+    // a pipeline hop that continues from a previous node gets the wide hc residual itself as embd input
+    // (rows of n_embd*hc), broadcasting it again would multiply its width by hc a second time
+    ggml_tensor * res_hc;
+    if (!ubatch.token && inpL->ne[0] == n_embd*hc) {
+        qwen4exp_check_reshape3d("res_hc_init_inpL_wide", inpL, n_embd, hc, n_tokens);
+        res_hc = ggml_reshape_3d(ctx0, inpL, n_embd, hc, n_tokens);
+    } else {
+        qwen4exp_check_reshape3d("res_hc_init_inpL", inpL, n_embd, 1, n_tokens);
+        res_hc = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
+                n_embd, hc, n_tokens, 1);
+    }
     cb(res_hc, "hc_init", -1);
     // make sure hc_init is in the same graph split as the first layer (-sm tensor)
     ggml_build_forward_expand(gf, res_hc);
@@ -529,6 +557,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
             res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
             res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+            qwen4exp_check_reshape3d("res_hc_filter_final", res_hc, n_embd, hc, res_hc->ne[1]);
             res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
         }
 
