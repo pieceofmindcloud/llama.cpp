@@ -555,7 +555,22 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = ggml_get_rows(ctx0, cur, inp_out_ids);
             attn_mix.inject = ggml_get_rows(ctx0, attn_mix.inject, inp_out_ids);
 
-            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+            // res_hc is a 4D tensor ([n_embd, hc, n_tokens, n_seqs] in general,
+            // built via ggml_repeat_4d). Reading ne[2] alone silently drops a
+            // live n_seqs factor whenever this ubatch batches more than one
+            // sequence (this model's scheduler does batch multiple sessions
+            // together). Deriving the flattened token count from the actual
+            // element count is correct whether or not that 4th dim is 1, and
+            // is a no-op change when it is.
+            const int64_t res_hc_elements = ggml_nelements(res_hc);
+            const int64_t res_hc_tokens   = res_hc_elements / (n_embd * hc);
+            if (res_hc_tokens * n_embd * hc != res_hc_elements) {
+                LLAMA_LOG_ERROR("%s: res_hc has %" PRId64 " elements, not divisible by n_embd*hc (%" PRId64 "*%" PRId64 "); ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "], n_out=%" PRId64 "\n",
+                        __func__, res_hc_elements, n_embd, hc,
+                        res_hc->ne[0], res_hc->ne[1], res_hc->ne[2], res_hc->ne[3],
+                        (int64_t) inp_out_ids->ne[0]);
+            }
+            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc_tokens);
             res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
             qwen4exp_check_reshape3d("res_hc_filter_final", res_hc, n_embd, hc, res_hc->ne[1]);
             res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
