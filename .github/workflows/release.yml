@@ -151,8 +151,6 @@ jobs:
             os: ubuntu-22.04
           - build: 'arm64'
             os: ubuntu-24.04-arm
-          - build: 's390x'
-            os: ubuntu-24.04-s390x
 
     runs-on: ${{ matrix.os }}
 
@@ -186,7 +184,6 @@ jobs:
           echo "CXX=g++-14" >> "$GITHUB_ENV"
 
       - name: ccache
-        if: ${{ matrix.build != 's390x' }}
         uses: ggml-org/ccache-action@v1.2.24
         with:
           key: release-${{ matrix.os }}-cpu
@@ -221,7 +218,6 @@ jobs:
           name: llama-bin-ubuntu-${{ matrix.build }}.tar.gz
 
       - name: ccache-clear
-        if: ${{ matrix.build != 's390x' }}
         uses: ./.github/actions/ccache-clear
         with:
           key: release-${{ matrix.os }}-cpu
@@ -325,6 +321,11 @@ jobs:
             cuda: '12.8.2'
             label: '12.8'
             defines: '-DGGML_CUDA_CUB_3DOT2=ON'
+          - build: 'x64'
+            os: ubuntu-24.04
+            cuda: '13.2.1'
+            label: '13.2'
+            defines: ''
           - build: 'x64'
             os: ubuntu-24.04
             cuda: '13.3.1'
@@ -1850,10 +1851,10 @@ jobs:
             **Linux:**
             - [Ubuntu x64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-x64.tar.gz)
             - [Ubuntu arm64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-arm64.tar.gz)
-            - [Ubuntu s390x (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-s390x.tar.gz)
             - [Ubuntu x64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-x64.tar.gz)
             - [Ubuntu arm64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-arm64.tar.gz)
             - [Ubuntu x64 (CUDA 12)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-12.8-x64.tar.gz) - [CUDA 12.8 libraries](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-12.8-x64.tar.gz)
+            - [Ubuntu x64 (CUDA 13.2)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.2-x64.tar.gz) - [CUDA 13.2 libraries](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.2-x64.tar.gz)
             - [Ubuntu x64 (CUDA 13)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.3-x64.tar.gz) - [CUDA 13.3 libraries](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.3-x64.tar.gz)
             - [Ubuntu arm64 (CUDA 13)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.3-arm64.tar.gz) - [CUDA 13.3 libraries](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.3-arm64.tar.gz)
             - [Ubuntu x64 (ROCm 10.0)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-rocm-10.0-x64.tar.gz)
