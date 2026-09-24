@@ -175,7 +175,8 @@ struct decision_field {
 
 engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs)
     : ctx(ctx), vocab(llama_model_get_vocab(llama_get_model(ctx))), mem(llama_get_memory(ctx)),
-      seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1) {
+      seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1),
+      pad_branches(llama_model_is_recurrent(llama_get_model(ctx)) || llama_model_is_hybrid(llama_get_model(ctx))) {
     if (n_seqs < 3) {
         throw std::invalid_argument("a decision engine needs at least 3 sequences");
     }
@@ -194,26 +195,24 @@ tokens_t engine::tokenize(const std::string & text, bool add_special) const {
 // Decode several prompts, each on its own sequence, packed into as few batches as n_batch allows.
 void engine::decode_parts(const std::vector<prompt_part> & parts) {
     const int n_batch = (int) llama_n_batch(ctx);
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    common_batch batch(ctx);
     auto flush = [&]() {
-        const int rc = batch.n_tokens > 0 ? llama_decode(ctx, batch) : 0;
-        common_batch_clear(batch);
+        const int rc = batch.size() > 0 ? llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) : 0;
+        batch.clear();
         if (rc != 0) {
-            llama_batch_free(batch);
             throw std::runtime_error(rc == 1 ? "no free KV cache space for the decision prompt"
                                              : "llama_decode failed on the decision prompt (" + std::to_string(rc) + ")");
         }
     };
     for (const auto & p : parts) {
         for (size_t i = 0; i < p.toks->size(); ++i) {
-            if (batch.n_tokens == n_batch) {
+            if (batch.size() == n_batch) {
                 flush();
             }
-            common_batch_add(batch, (*p.toks)[i], p.pos0 + (llama_pos) i, { p.seq }, false);
+            batch.add((*p.toks)[i], p.pos0 + (llama_pos) i, p.seq, false);
         }
     }
     flush();
-    llama_batch_free(batch);
 }
 
 // Restore (or build) the cached static prefix on seq_snap. Only this engine's own sequences are
@@ -236,47 +235,67 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache) {
 
 // Score each branch as its own sequence forked from its trunk; return each branch's last-token
 // logits restricted to its candidate tokens. Groups are bounded by free sequences and batch rows.
+//
+// Recurrent layers take a ubatch only when every sequence in it holds the same number of tokens
+// (split_equal), so on recurrent/hybrid models uneven branches would split one decode into many
+// passes. There each group is right-padded to its longest branch (longest first, so padding stays
+// small). Every layer is causal, so the logits read at a branch's last real token don't see the
+// padding, and the padded cells are removed with the branch.
 std::vector<std::vector<float>> engine::score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free) {
     std::vector<std::vector<float>> result(branches.size());
+    std::vector<size_t> order(branches.size());
+    for (size_t b = 0; b < order.size(); ++b) {
+        order[b] = b;
+    }
+    if (pad_branches) {
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return branches[a].toks.size() > branches[b].toks.size();
+        });
+    }
     const int max_rows = (int) llama_n_batch(ctx);
     size_t start = 0;
-    while (start < branches.size()) {
+    while (start < order.size()) {
+        const int width = (int) branches[order[start]].toks.size(); // padded length of this group
         size_t end  = start;
         int    rows = 0;
-        while (end < branches.size() && (int) (end - start) < n_free && rows + (int) branches[end].toks.size() <= max_rows) {
-            rows += (int) branches[end].toks.size();
+        while (end < order.size() && (int) (end - start) < n_free) {
+            const int need = pad_branches ? width : (int) branches[order[end]].toks.size();
+            if (rows + need > max_rows) {
+                break;
+            }
+            rows += need;
             ++end;
         }
         if (end == start) {
             throw std::runtime_error("a decision suffix exceeds the batch size");
         }
-        llama_batch batch = llama_batch_init(rows, 0, 1);
+        common_batch batch(ctx);
         std::vector<int> out_idx;
-        for (size_t b = start; b < end; ++b) {
-            const llama_seq_id seq = first + (llama_seq_id) (b - start);
+        for (size_t k = start; k < end; ++k) {
+            const auto &       br  = branches[order[k]];
+            const llama_seq_id seq = first + (llama_seq_id) (k - start);
             llama_memory_seq_rm(mem, seq, -1, -1);
-            llama_memory_seq_cp(mem, branches[b].trunk, seq, -1, -1);
-            const auto & toks = branches[b].toks;
-            for (size_t i = 0; i < toks.size(); ++i) {
-                const bool last = i + 1 == toks.size();
+            llama_memory_seq_cp(mem, br.trunk, seq, -1, -1);
+            const int n = pad_branches ? width : (int) br.toks.size();
+            for (int i = 0; i < n; ++i) {
+                const bool last = i + 1 == (int) br.toks.size();
                 if (last) {
-                    out_idx.push_back(batch.n_tokens);
+                    out_idx.push_back(batch.size());
                 }
-                common_batch_add(batch, toks[i], branches[b].pos0 + (llama_pos) i, { seq }, last);
+                batch.add(br.toks[std::min(i, (int) br.toks.size() - 1)], br.pos0 + (llama_pos) i, seq, last);
             }
         }
-        const int rc = llama_decode(ctx, batch);
-        llama_batch_free(batch);
+        const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (rc != 0) {
             throw std::runtime_error(rc == 1 ? "no free KV cache space for the decision branches"
                                              : "llama_decode failed on the decision branches (" + std::to_string(rc) + ")");
         }
-        for (size_t b = start; b < end; ++b) {
-            const float * logits = llama_get_logits_ith(ctx, out_idx[b - start]);
-            for (llama_token t : branches[b].cands) {
-                result[b].push_back(logits[t]);
+        for (size_t k = start; k < end; ++k) {
+            const float * logits = llama_get_logits_ith(ctx, out_idx[k - start]);
+            for (llama_token t : branches[order[k]].cands) {
+                result[order[k]].push_back(logits[t]);
             }
-            llama_memory_seq_rm(mem, first + (llama_seq_id) (b - start), -1, -1);
+            llama_memory_seq_rm(mem, first + (llama_seq_id) (k - start), -1, -1);
         }
         start = end;
     }
@@ -658,7 +677,7 @@ std::pair<std::string, std::string> render_prompt(const common_chat_templates * 
     usr.role    = "user";
     usr.content = sentinel;
     in.messages = { sys, usr };
-    const std::string prompt = common_chat_templates_apply(tmpls, in).prompt;
+    const std::string prompt = common_chat_templates_apply(tmpls, in).prompt.str();
     const size_t at = prompt.find(sentinel);
     if (at == std::string::npos) {
         throw std::runtime_error("the chat template did not keep the user message");
