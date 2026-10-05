@@ -331,6 +331,12 @@ struct llama_moe_cache::impl {
             }
             ggml_backend_buffer_clear(buf.get(), 0);
             buf_size = ggml_backend_buffer_get_size(buf.get());
+            // every view must point into a bank, whatever ranges the allocator split the banks in
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (t->view_src != nullptr && t->buffer == nullptr && ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error("failed to initialize a MoE cache view");
+                }
+            }
         }
 
         LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts\n", __func__,
