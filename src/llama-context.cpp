@@ -473,12 +473,6 @@ llama_context::llama_context(
             if (!cparams.op_offload) {
                 throw std::runtime_error("MoE cache requires op offload");
             }
-            // the cache plans its uploads once per graph, which the several graph
-            // copies of pipeline parallelism would race on
-            if (cparams.pipeline_parallel) {
-                LLAMA_LOG_INFO("%s: pipeline parallelism disabled: the MoE cache uses a single graph copy\n", __func__);
-                cparams.pipeline_parallel = false;
-            }
             // one cache per GPU, each for the experts of the layers assigned to it
             std::vector<ggml_backend_t> cache_backends;
             std::vector<ggml_backend_buffer_type_t> cache_bufts;
@@ -493,6 +487,17 @@ llama_context::llama_context(
                 throw std::runtime_error("MoE cache requires a GPU backend");
             }
             moe_cache = std::make_unique<llama_moe_cache>(model, cache_backends, cache_bufts, cparams.moe_cache_size);
+            if (!moe_cache->active()) {
+                // every expert layer is in VRAM (or the budget holds no token): run as without the cache,
+                // so this context measures and allocates exactly like one without it
+                LLAMA_LOG_WARN("%s: the MoE cache has nothing to hold, it is disabled\n", __func__);
+                moe_cache.reset();
+            } else if (cparams.pipeline_parallel) {
+                // the cache plans its uploads once per graph, which the several graph
+                // copies of pipeline parallelism would race on
+                LLAMA_LOG_INFO("%s: pipeline parallelism disabled: the MoE cache uses a single graph copy\n", __func__);
+                cparams.pipeline_parallel = false;
+            }
         }
 
         sched_reserve();

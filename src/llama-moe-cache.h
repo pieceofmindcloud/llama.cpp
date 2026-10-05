@@ -21,6 +21,10 @@ public:
 
     ggml_backend_t backend() const;
 
+    // false when no GPU holds a layer that keeps all of its experts in host memory
+    // (the fit placed every expert layer in VRAM): there is nothing to cache
+    bool active() const;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
     // ggml_backend_sched callbacks, user_data is the llama_moe_cache

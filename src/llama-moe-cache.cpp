@@ -453,9 +453,10 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<gg
     for (size_t i = 0; i < backends.size(); ++i) {
         caches.push_back(std::make_unique<impl>(model, backends[i], bufts[i], size));
     }
-    if (std::none_of(caches.begin(), caches.end(), [](const std::unique_ptr<impl> & c) { return !c->bindings.empty(); })) {
-        throw std::runtime_error("MoE cache is too small or no layer keeps its experts in host memory");
-    }
+}
+
+bool llama_moe_cache::active() const {
+    return std::any_of(caches.begin(), caches.end(), [](const std::unique_ptr<impl> & c) { return !c->bindings.empty(); });
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
