@@ -57,6 +57,8 @@ struct llama_cparams {
     const uint8_t * moe_external_executor_layers = nullptr;
     size_t moe_external_executor_layer_count = 0;
 
+    size_t moe_cache_size;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

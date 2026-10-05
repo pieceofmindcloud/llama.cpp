@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-cache.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -19,6 +20,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 
 //
 // llama_context
@@ -87,6 +90,10 @@ llama_context::llama_context(
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    if (model.lazy_reader_factory) {
+        const int n_readers = (int) std::max(1u, std::thread::hardware_concurrency());
+        lazy_reader = model.lazy_reader_factory->create(n_readers);
+    }
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -272,8 +279,9 @@ llama_context::llama_context(
         }
     }
 
-    cparams.op_offload = params.op_offload;
-    cparams.kv_unified = params.kv_unified;
+    cparams.op_offload     = params.op_offload;
+    cparams.kv_unified     = params.kv_unified;
+    cparams.moe_cache_size = params.moe_cache_size;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -461,6 +469,25 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (cparams.moe_cache_size > 0) {
+            if (!cparams.op_offload) {
+                throw std::runtime_error("MoE cache requires op offload");
+            }
+            if (cparams.pipeline_parallel || model.n_devices() > 1) {
+                throw std::runtime_error("MoE cache does not support multiple devices");
+            }
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cparams.moe_cache_size);
+                    break;
+                }
+            }
+            if (!moe_cache) {
+                throw std::runtime_error("MoE cache requires a GPU backend");
+            }
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -608,7 +635,14 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    auto create_sched = [&](bool parallel) {
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+        if (moe_cache) {
+            ggml_backend_sched_set_moe_cache(sched.get(), moe_cache->backend(),
+                llama_moe_cache::sched_resolve, llama_moe_cache::sched_begin, llama_moe_cache::sched_prepare, moe_cache.get());
+        }
+    };
+    create_sched(cparams.pipeline_parallel);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -643,7 +677,7 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                create_sched(false);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -1429,7 +1463,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
+        try {
+            res->set_inputs(&ubatch);
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: failed to set graph inputs: %s\n", __func__, e.what());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -2566,6 +2606,7 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
+        /*.lazy_reader =*/ lazy_reader.get(),
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
@@ -3454,6 +3495,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    if (moe_cache) {
+        for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
+            ret[buft].context += size;
+        }
+    }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
@@ -3731,6 +3777,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.moe_cache_size              =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
