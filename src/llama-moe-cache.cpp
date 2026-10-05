@@ -172,6 +172,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * src;    // host expert tensor
         ggml_tensor * bank;   // device storage of all slots
         ggml_tensor * cached; // view of the bank used in place of src
+        bool reported = false; // a mismatch was logged once
     };
 
     struct layer_state {
@@ -311,7 +312,7 @@ struct llama_moe_cache::impl {
                     ggml_format_name(cached, "moe_cache.%s", experts[ip]->name);
                     binding_of[experts[ip]] = bindings.size();
                     layers[il].bindings.push_back(bindings.size());
-                    bindings.push_back({ this, il, (int32_t) ig, experts[ip], bank, cached });
+                    bindings.push_back({ this, il, (int32_t) ig, experts[ip], bank, cached, false });
                 }
             }
             buf_size += alloc_size(g, g.n_slots);
@@ -353,6 +354,19 @@ struct llama_moe_cache::impl {
             return false;
         }
         binding & b = bindings[it->second];
+
+        // the scheduler replaces the weight with this view: a view without a buffer, or
+        // with another shape than the weight, would abort it, so the layer is not cached
+        if (b.cached->buffer == nullptr || b.cached->ne[0] != b.src->ne[0] || b.cached->ne[1] != b.src->ne[1]) {
+            if (!b.reported) {
+                b.reported = true;
+                LLAMA_LOG_WARN("%s: %s: layer %d not cached: view %s (buffer %p, ne %lld x %lld) does not match %s (ne %lld x %lld)\n",
+                    __func__, ggml_backend_name(backend), b.il, b.cached->name, (void *) b.cached->buffer,
+                    (long long) b.cached->ne[0], (long long) b.cached->ne[1], b.src->name,
+                    (long long) b.src->ne[0], (long long) b.src->ne[1]);
+            }
+            return false;
+        }
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
         const int64_t n_tokens = node->src[2]->ne[1];
