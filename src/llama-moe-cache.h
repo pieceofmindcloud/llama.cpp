@@ -7,11 +7,16 @@
 
 struct llama_model;
 
+#include <vector>
+
 // keeps the most recently used experts of host-resident MoE layers in a device buffer
 // MUL_MAT_ID ops on these experts run on the device and only the cache misses are uploaded
+// with several GPUs, each one gets its own cache of `size` bytes for the experts of the
+// layers assigned to it, so every card keeps its share of the model in VRAM
 class llama_moe_cache {
 public:
-    llama_moe_cache(const llama_model & model, ggml_backend_t backend, ggml_backend_buffer_type_t buft, size_t size);
+    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends,
+            const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
     ~llama_moe_cache();
 
     ggml_backend_t backend() const;
@@ -25,5 +30,5 @@ public:
 
 private:
     struct impl;
-    std::unique_ptr<impl> pimpl;
+    std::vector<std::unique_ptr<impl>> caches; // one per GPU
 };

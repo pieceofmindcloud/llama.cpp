@@ -1164,14 +1164,18 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
-                    // experts held by the MoE cache run on the cache backend
+                    // experts held by the MoE cache run on the backend whose cache
+                    // holds them: with several GPUs, each one caches the experts of
+                    // its own layers, so ask every higher-priority backend
                     if (i == 0 && tensor->op == GGML_OP_MUL_MAT_ID && sched->moe_cache_backend != NULL) {
-                        ggml_tensor * cached = NULL;
-                        void * handle = NULL;
-                        if (sched->callback_moe_cache_resolve(sched->callback_moe_cache_user_data, tensor, sched->moe_cache_backend, &cached, &handle) &&
-                            ggml_backend_supports_op(sched->moe_cache_backend, tensor)) {
-                            SET_CAUSE(tensor, "1.moe");
-                            return ggml_backend_sched_backend_id(sched, sched->moe_cache_backend);
+                        for (int b = 0; b < src_backend_id; b++) {
+                            ggml_tensor * cached = NULL;
+                            void * handle = NULL;
+                            if (sched->callback_moe_cache_resolve(sched->callback_moe_cache_user_data, tensor, sched->backends[b], &cached, &handle) &&
+                                ggml_backend_supports_op(sched->backends[b], tensor)) {
+                                SET_CAUSE(tensor, "1.moe");
+                                return b;
+                            }
                         }
                     }
                     for (int b = 0; b < src_backend_id; b++) {

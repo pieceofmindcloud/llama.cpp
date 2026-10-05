@@ -166,6 +166,7 @@ struct llama_moe_cache::impl {
     };
 
     struct binding {
+        impl * owner;         // the device cache that holds this binding
         int32_t il;
         int32_t ig;
         ggml_tensor * src;    // host expert tensor
@@ -243,7 +244,8 @@ struct llama_moe_cache::impl {
             }
         }
         if (groups.empty()) {
-            LLAMA_LOG_WARN("%s: no layer has all of its experts in host memory, MoE cache is disabled\n", __func__);
+            LLAMA_LOG_WARN("%s: %s: no layer of this device has all of its experts in host memory, its MoE cache is disabled\n",
+                __func__, ggml_backend_dev_name(dev));
             return;
         }
 
@@ -274,7 +276,10 @@ struct llama_moe_cache::impl {
             n_tensors += g.ref.size()*(1 + g.layers.size());
         }
         if (n_tensors == 0) {
-            throw std::runtime_error("MoE cache is too small to hold the experts of one token");
+            // one device out of several may get no cache; the set checks that some device has one
+            LLAMA_LOG_WARN("%s: %s: MoE cache is too small to hold the experts of one token\n", __func__, ggml_backend_dev_name(dev));
+            groups.clear();
+            return;
         }
 
         ggml_init_params params = {
@@ -306,7 +311,7 @@ struct llama_moe_cache::impl {
                     ggml_format_name(cached, "moe_cache.%s", experts[ip]->name);
                     binding_of[experts[ip]] = bindings.size();
                     layers[il].bindings.push_back(bindings.size());
-                    bindings.push_back({ il, (int32_t) ig, experts[ip], bank, cached });
+                    bindings.push_back({ this, il, (int32_t) ig, experts[ip], bank, cached });
                 }
             }
             buf_size += alloc_size(g, g.n_slots);
@@ -428,32 +433,51 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, ggml_backend_t backend, ggml_backend_buffer_type_t buft, size_t size) :
-    pimpl(new impl(model, backend, buft, size)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends,
+        const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) {
+    GGML_ASSERT(backends.size() == bufts.size() && !backends.empty());
+    for (size_t i = 0; i < backends.size(); ++i) {
+        caches.push_back(std::make_unique<impl>(model, backends[i], bufts[i], size));
+    }
+    if (std::none_of(caches.begin(), caches.end(), [](const std::unique_ptr<impl> & c) { return !c->bindings.empty(); })) {
+        throw std::runtime_error("MoE cache is too small or no layer keeps its experts in host memory");
+    }
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
 
 ggml_backend_t llama_moe_cache::backend() const {
-    return pimpl->backend;
+    return caches.front()->backend;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> res;
-    if (pimpl->buf) {
-        res[ggml_backend_buffer_get_type(pimpl->buf.get())] = pimpl->buf_size;
+    for (const auto & c : caches) {
+        if (c->buf) {
+            res[ggml_backend_buffer_get_type(c->buf.get())] += c->buf_size;
+        }
     }
     return res;
 }
 
 bool llama_moe_cache::sched_resolve(void * user_data, const ggml_tensor * node, ggml_backend_t backend, ggml_tensor ** cached_weight, void ** cache_entry) {
-    return static_cast<llama_moe_cache *>(user_data)->pimpl->resolve(node, backend, cached_weight, cache_entry);
+    // each device cache only answers for its own backend
+    for (const auto & c : static_cast<llama_moe_cache *>(user_data)->caches) {
+        if (c->resolve(node, backend, cached_weight, cache_entry)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void llama_moe_cache::sched_begin(void * user_data) {
-    static_cast<llama_moe_cache *>(user_data)->pimpl->begin();
+    for (const auto & c : static_cast<llama_moe_cache *>(user_data)->caches) {
+        c->begin();
+    }
 }
 
 bool llama_moe_cache::sched_prepare(void * user_data, void * cache_entry, const int32_t * ids, size_t n_ids, const int32_t ** remapped_ids) {
-    return static_cast<llama_moe_cache *>(user_data)->pimpl->prepare(static_cast<const impl::binding *>(cache_entry), ids, n_ids, remapped_ids);
+    GGML_UNUSED(user_data);
+    const auto * entry = static_cast<const impl::binding *>(cache_entry);
+    return entry->owner->prepare(entry, ids, n_ids, remapped_ids);
 }

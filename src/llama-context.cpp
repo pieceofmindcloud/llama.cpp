@@ -473,19 +473,26 @@ llama_context::llama_context(
             if (!cparams.op_offload) {
                 throw std::runtime_error("MoE cache requires op offload");
             }
-            if (cparams.pipeline_parallel || model.n_devices() > 1) {
-                throw std::runtime_error("MoE cache does not support multiple devices");
+            // the cache plans its uploads once per graph, which the several graph
+            // copies of pipeline parallelism would race on
+            if (cparams.pipeline_parallel) {
+                LLAMA_LOG_INFO("%s: pipeline parallelism disabled: the MoE cache uses a single graph copy\n", __func__);
+                cparams.pipeline_parallel = false;
             }
+            // one cache per GPU, each for the experts of the layers assigned to it
+            std::vector<ggml_backend_t> cache_backends;
+            std::vector<ggml_backend_buffer_type_t> cache_bufts;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
                 if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                    moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cparams.moe_cache_size);
-                    break;
+                    cache_backends.push_back(backend_ptrs[i]);
+                    cache_bufts.push_back(backend_buft[i]);
                 }
             }
-            if (!moe_cache) {
+            if (cache_backends.empty()) {
                 throw std::runtime_error("MoE cache requires a GPU backend");
             }
+            moe_cache = std::make_unique<llama_moe_cache>(model, cache_backends, cache_bufts, cparams.moe_cache_size);
         }
 
         sched_reserve();
