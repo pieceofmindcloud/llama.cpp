@@ -76,4 +76,11 @@ if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
+    # POM's C++ bridge (llama-cpp-sys-2/wrapper_common.cpp) calls internal
+    # llama_model/llama_context methods. A .so exports them already; a
+    # Windows DLL only exports LLAMA_API, so linking POM against the release
+    # DLL left those symbols unresolved. Same setting as common and mtmd.
+    if (WIN32)
+        set_target_properties(llama PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    endif()
 endif()
