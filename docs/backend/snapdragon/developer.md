@@ -329,4 +329,3 @@ Multi-device execution synchronizes worker sessions through atomic fence slots a
   - [`htp_tensor_flush_all()`](../../../ggml/src/ggml-hexagon/htp/htp-tensor.h) flushes only modified tensor address ranges,
     ensuring peer devices and the host CPU observe consistent data in DDR.
 - Never signal completion before all DMA transfers are drained and dirty tensor flushes have completed.
-

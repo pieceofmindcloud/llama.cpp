@@ -53,6 +53,11 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool moe_external_executor;
+    const uint8_t * moe_external_executor_layers = nullptr;
+    size_t moe_external_executor_layer_count = 0;
+
+    size_t moe_cache_size;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
@@ -62,6 +67,9 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    llama_moe_ffn_callback cb_moe_ffn = nullptr;
+    void * cb_moe_ffn_user_data = nullptr;
 
     llama_context * ctx_other;
 };

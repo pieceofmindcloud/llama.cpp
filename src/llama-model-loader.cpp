@@ -540,9 +540,15 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         bool no_alloc,
         bool load_mtp,
+        bool moe_external_executor,
+        const uint8_t * moe_external_executor_layers,
+        size_t moe_external_executor_layer_count,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+    this->moe_external_executor = moe_external_executor;
+    this->moe_external_executor_layers = moe_external_executor_layers;
+    this->moe_external_executor_layer_count = moe_external_executor_layer_count;
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -836,6 +842,10 @@ llama_model_loader::llama_model_loader(
     this->load_mtp = load_mtp;
 }
 
+ggml_context_ptr llama_model_loader::take_external_moe_context() {
+    return std::move(external_moe_ctx);
+}
+
 std::string llama_model_loader::get_arch_name() const {
     return arch_name;
 }
@@ -1092,13 +1102,12 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
 
     // do not lazy-read small tensors, it has significant overhead and is not worth it
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+    if (mode == LLAMA_LAZY_MODE_AUTO && ggml_nbytes(t) <= auto_min_size) {
         return false;
     }
 
-    if (!llama_mmap::SUPPORTED) {
-        LLAMA_LOG_WARN("%s: mmap is not available, so tensor %s (size = %zu MiB) is loaded into RAM in full\n",
-                __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
+    if (!ggml_is_matrix(t) || (t->type != GGML_TYPE_F32 && ggml_get_type_traits(t->type)->to_float == nullptr)) {
+        LLAMA_LOG_WARN("%s: tensor %s cannot be read row by row, loading it in full\n", __func__, name.c_str());
         return false;
     }
 
@@ -1116,6 +1125,56 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    const auto is_external_moe_tensor = [&]() {
+        if (!moe_external_executor) {
+            return false;
+        }
+
+        if (moe_external_executor_layers != nullptr && tn.bid >= 0) {
+            if (static_cast<size_t>(tn.bid) >= moe_external_executor_layer_count ||
+                    moe_external_executor_layers[tn.bid] == 0) {
+                return false;
+            }
+        }
+
+        switch (tn.tensor) {
+            case LLM_TENSOR_FFN_DOWN_EXP:
+            case LLM_TENSOR_FFN_GATE_EXP:
+            case LLM_TENSOR_FFN_UP_EXP:
+            case LLM_TENSOR_FFN_DOWN_EXPS:
+            case LLM_TENSOR_FFN_GATE_EXPS:
+            case LLM_TENSOR_FFN_UP_EXPS:
+            case LLM_TENSOR_FFN_GATE_UP_EXPS:
+            case LLM_TENSOR_FFN_DOWN_CHEXPS:
+            case LLM_TENSOR_FFN_GATE_CHEXPS:
+            case LLM_TENSOR_FFN_UP_CHEXPS:
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    const auto create_external_metadata_tensor = [&](const ggml_tensor & t_meta) {
+        if (!external_moe_ctx) {
+            const size_t ctx_size = ggml_tensor_overhead() * (static_cast<size_t>(n_tensors) + 1);
+            ggml_init_params params = {
+                /*.mem_size   =*/ ctx_size,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            external_moe_ctx.reset(ggml_init(params));
+            if (!external_moe_ctx) {
+                throw std::runtime_error("failed to create metadata context for external MoE tensors");
+            }
+        }
+
+        ggml_tensor * ret = ggml_dup_tensor(external_moe_ctx.get(), &t_meta);
+        ggml_set_name(ret, t_meta.name);
+        external_moe_tensor_names.emplace(t_meta.name);
+        n_created++;
+        return ret;
+    };
+
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
@@ -1325,6 +1384,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_set_name(&t_meta, tn.str().c_str());
 
+        if (is_external_moe_tensor()) {
+            return create_external_metadata_tensor(t_meta);
+        }
+
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
         ggml_context * ctx = ctx_for_buft(buft);
@@ -1359,6 +1422,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
+
+    if (is_external_moe_tensor()) {
+        return create_external_metadata_tensor(t_meta);
+    }
 
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
@@ -1408,8 +1475,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
-    // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
-    if (use_mmap || lazy.any()) {
+    if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (uint32_t idx = 0; idx < files.size(); idx++) {
@@ -1442,6 +1508,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
+        if (external_moe_tensor_names.count(it.first) != 0) {
+            continue;
+        }
         size_data += ggml_nbytes(it.second.tensor);
     }
 }
@@ -1637,7 +1706,12 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        const bool from_mapping = use_mmap || lazy.has(cur);
+        if (lazy.has(cur)) {
+            size_done += n_size;
+            continue;
+        }
+
+        const bool from_mapping = use_mmap;
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1657,8 +1731,7 @@ bool llama_model_loader::load_all_data(
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
 
-                // locking a lazy tensor would fault all of it in, which is what lazy avoids
-                if (lmlocks && !lazy.has(cur)) {
+                if (lmlocks) {
                     const auto & lmlock = lmlocks->at(weight->idx);
                     lmlock->grow_to(weight->offs + n_size);
                 }

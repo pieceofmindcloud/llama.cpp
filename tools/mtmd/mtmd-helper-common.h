@@ -96,6 +96,7 @@ struct decode_embd_batch {
             /*n_seq_id       =*/ n_seq_id.data(),
             /*seq_id         =*/ seq_ids.data(),
             /*logits         =*/ logits.data(),
+            /*n_embd         =*/ n_mmproj_embd,
         };
     }
 
@@ -171,7 +172,7 @@ struct decode_embd_batch {
             // normal
             pos_ptr = pos.data() + offset;
         }
-        return {
+        llama_batch view = {
             /*n_tokens       =*/ n_tokens,
             /*tokens         =*/ nullptr,
             /*embd           =*/ batch.embd     + offset * n_mmproj_embd,
@@ -179,6 +180,8 @@ struct decode_embd_batch {
             /*n_seq_id       =*/ batch.n_seq_id + offset,
             /*seq_id         =*/ batch.seq_id   + offset,
             /*logits         =*/ batch.logits   + offset,
+            /*n_embd         =*/ batch.n_embd,
         };
+        return view;
     }
 };

@@ -1089,4 +1089,3 @@ static vk_op_binary_push_constants ggml_vk_rms_norm_push_constants(
         eps, 0.0f, (int32_t)num_partials,
     };
 }
-

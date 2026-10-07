@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -69,7 +70,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP            = 1 << 2;
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
-    static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -83,6 +84,9 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    bool moe_external_executor;
+    const uint8_t * moe_external_executor_layers;
+    size_t moe_external_executor_layer_count;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
@@ -93,10 +97,6 @@ struct llama_model_loader {
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
         bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
-
-        bool any() const {
-            return !ranges.empty();
-        }
 
         bool has(const ggml_tensor * t) const {
             return tensors.count(ggml_get_name(t)) > 0;
@@ -147,6 +147,9 @@ struct llama_model_loader {
         }
     };
 
+    ggml_context_ptr external_moe_ctx;
+    std::unordered_set<std::string> external_moe_tensor_names;
+
     // lazy tensors need dedicated context
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
@@ -182,8 +185,15 @@ struct llama_model_loader {
         bool check_tensors,
         bool no_alloc,
         bool load_mtp,
+        bool moe_external_executor,
+        const uint8_t * moe_external_executor_layers,
+        size_t moe_external_executor_layer_count,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+
+    // Transfers the metadata-only context to llama_model. Its tensors have
+    // names, shapes and dtypes but no backend buffer or data allocation.
+    ggml_context_ptr take_external_moe_context();
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

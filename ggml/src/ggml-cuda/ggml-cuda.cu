@@ -552,17 +552,34 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     }
 
     ~ggml_cuda_pool_vmm() {
+        release_unused();
         if (pool_addr != 0) {
-#if defined(GGML_USE_HIP)
-            // Workaround for https://github.com/ROCm/ROCR-Runtime/issues/285
-            for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
-                CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
-            }
-#else
-            CU_CHECK(cuMemUnmap(pool_addr, pool_size));
-#endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
+    }
+
+    // Unmaps the physical pages backing the pool's current reservation and
+    // resets it to empty, keeping the virtual address range itself (so a
+    // later alloc() does not need to reserve it again). Safe only while
+    // nothing is on loan from the pool (pool_used == 0): the LIFO discipline
+    // in alloc()/free() means every live pointer sits somewhere in
+    // [pool_addr, pool_addr + pool_used), so an empty pool has nothing
+    // mapped that a caller still holds.
+    void release_unused() {
+        if (pool_addr == 0 || pool_size == 0) {
+            return;
+        }
+        GGML_ASSERT(pool_used == 0);
+#if defined(GGML_USE_HIP)
+        // Workaround for https://github.com/ROCm/ROCR-Runtime/issues/285
+        for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
+            CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
+        }
+        mappings.clear();
+#else
+        CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+#endif
+        pool_size = 0;
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
@@ -585,7 +602,26 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            CUresult alloc_err = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (alloc_err == CUDA_ERROR_OUT_OF_MEMORY && pool_used == 0 && pool_size > 0) {
+                // Nothing is on loan from this pool right now, but it still
+                // holds physical pages reserved by an earlier, larger
+                // request - the VMM pool never gives those back on its own
+                // (unlike ggml_cuda_pool_leg::alloc, which already flushes
+                // and retries on this same error). A caller that only ever
+                // needed a bigger batch once keeps that whole reservation
+                // pinned for the life of the process, which can starve a
+                // later allocation on a device that is otherwise idle.
+                GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, "
+                               "releasing %.2f MiB of unused VMM reservation and retrying\n",
+                               device, reserve_size / 1024.0 / 1024.0, pool_size / 1024.0 / 1024.0);
+                release_unused();
+                // pool_size just dropped to 0, so the whole request (not the
+                // old size-avail delta) has to be reserved fresh.
+                reserve_size = granularity * ((size + granularity - 1) / granularity);
+                alloc_err = cuMemCreate(&handle, reserve_size, &prop, 0);
+            }
+            CU_CHECK(alloc_err);
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {

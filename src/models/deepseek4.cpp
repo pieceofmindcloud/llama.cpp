@@ -1232,8 +1232,19 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
 
     const int64_t hc = hparams.dsv4_hc_mult;
-    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+    ggml_tensor * inpL;
+    if (ubatch.embd && inp->ne[0] != hparams.n_embd_inp()) {
+        const int64_t expanded_width = hparams.n_embd_out();
+        if (inp->ne[0] != expanded_width || expanded_width % n_embd != 0) {
+            throw std::runtime_error(
+                    "hidden state shape [" + std::to_string(n_tokens) + ", " +
+                    std::to_string(inp->ne[0]) + "] is incompatible with the model input geometry");
+        }
+        inpL = ggml_reshape_3d(ctx0, inp, n_embd, expanded_width / n_embd, n_tokens);
+    } else {
+        inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+    }
     cb(inpL, "hc_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {

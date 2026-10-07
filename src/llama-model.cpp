@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
+#include "llama-lazy-reader.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
@@ -28,6 +29,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -38,6 +40,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -1189,6 +1192,11 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+    std::set<const ggml_context *> lazy_ctxs;
+
+    // Metadata-only contexts for routed MoE tensors owned by an external
+    // executor. They deliberately have no backend buffers.
+    std::vector<ggml_context_ptr> external_moe_contexts;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1208,6 +1216,11 @@ struct llama_model::impl {
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    if (params.moe_external_executor_layers != nullptr && params.moe_external_executor_layer_count > 0) {
+        external_moe_executor_layers.assign(
+            params.moe_external_executor_layers,
+            params.moe_external_executor_layers + params.moe_external_executor_layer_count);
+    }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -1447,18 +1460,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_backend_dev_get_props(dev.dev, &props);
             if (!props.caps.mmap_support) {
                 ml.use_mmap = false;
-                break;
-            }
-        }
-    }
-
-    // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
-    if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
-        for (const auto & dev : devices) {
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev.dev, &props);
-            if (!props.caps.mmap_support) {
-                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
                 break;
             }
         }
@@ -1730,6 +1731,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
+    if (auto external_ctx = ml.take_external_moe_context()) {
+        for (auto * cur = ggml_get_first_tensor(external_ctx.get()); cur != NULL; cur = ggml_get_next_tensor(external_ctx.get(), cur)) {
+            tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+        }
+        pimpl->external_moe_contexts.emplace_back(std::move(external_ctx));
+    }
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
@@ -1770,10 +1777,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         std::vector<ggml_backend_buffer_ptr> bufs;
 
-        // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
-        const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+        if (ctx_key.lazy) {
+            pimpl->lazy_ctxs.insert(ctx);
+        }
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (ml.use_mmap && !ctx_key.lazy && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1796,7 +1804,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         } else {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
+            if (ml.no_alloc || ctx_key.lazy) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
@@ -1807,7 +1815,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
-            if (use_mlock && ggml_backend_buffer_is_host(buf)) {
+            if (use_mlock && ggml_backend_buffer_is_host(buf) && ggml_backend_buffer_get_size(buf) > 0) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);
                 auto & mlock_buf = pimpl->mlock_bufs.back();
                 mlock_buf->init   (ggml_backend_buffer_get_base(buf));
@@ -1882,11 +1890,36 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
+void llama_model_base::add_lazy_reader(llama_model_loader & ml, const ggml_tensor * t) {
+    if (ml.no_alloc || !t || !ml.lazy.has(t)) {
+        return;
+    }
+
+    const char * name = ggml_get_name(t);
+
+    const auto * w = ml.get_weight(name);
+    if (!w) {
+        return;
+    }
+
+    if (!lazy_reader_factory) {
+        lazy_reader_factory = std::make_unique<llama_lazy_reader_factory>();
+    }
+    lazy_reader_factory->add(t, *ml.files[w->idx], w->offs);
+
+    LLAMA_LOG_INFO("%s: tensor %s row reads enabled: %" PRId64 " rows of %zu bytes at offset %zu of %s\n",
+            __func__, name, t->ne[1], ggml_row_size(t->type, t->ne[0]), w->offs, ml.files[w->idx]->name().c_str());
+}
+
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-    return ml.create_tensor(
+    ggml_tensor * t = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+
+    add_lazy_reader(ml, t);
+
+    return t;
 }
 
 std::string llama_model::arch_name() const {
@@ -1934,6 +1967,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         if (hparams.no_alloc) {
+            if (pimpl->lazy_ctxs.count(ctx.get())) {
+                continue;
+            }
             GGML_ASSERT(bufs.size() == 1);
             ggml_backend_buffer_t buf = bufs[0].get();
             GGML_ASSERT(ggml_backend_buffer_get_base(buf) == nullptr);
@@ -2234,6 +2270,29 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
+}
+
+bool llama_model::uses_external_moe_executor() const {
+    return params.moe_external_executor;
+}
+
+bool llama_model::uses_external_moe_executor_layer(int il) const {
+    if (!params.moe_external_executor) {
+        return false;
+    }
+    if (external_moe_executor_layers.empty()) {
+        return true;
+    }
+    return il >= 0 && static_cast<size_t>(il) < external_moe_executor_layers.size()
+        && external_moe_executor_layers[il] != 0;
+}
+
+const uint8_t * llama_model::external_moe_executor_layers_data() const {
+    return external_moe_executor_layers.empty() ? nullptr : external_moe_executor_layers.data();
+}
+
+size_t llama_model::external_moe_executor_layers_count() const {
+    return external_moe_executor_layers.size();
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
@@ -2539,7 +2598,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_QWEN4EXP);
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -2803,6 +2862,9 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.moe_external_executor       =*/ false,
+        /*.moe_external_executor_layers =*/ nullptr,
+        /*.moe_external_executor_layer_count =*/ 0,
     };
 
     return result;

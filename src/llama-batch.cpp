@@ -46,6 +46,13 @@ bool llama_batch_allocr::init(
         return false;
     }
 
+    if (batch.embd && batch.n_embd > 0 && static_cast<uint32_t>(batch.n_embd) != n_embd) {
+        LLAMA_LOG_ERROR(
+                "%s: embedding input shape [%d, %d] has width %d, expected allocator width %u\n",
+                __func__, batch.n_tokens, batch.n_embd, batch.n_embd, n_embd);
+        return false;
+    }
+
     if (batch.token) {
         for (int32_t i = 0; i < batch.n_tokens; ++i) {
             if (batch.token[i] < 0 || (uint32_t) batch.token[i] >= vocab.n_tokens()) {
@@ -216,6 +223,7 @@ bool llama_batch_allocr::init(
             /*.n_seqs       =*/ (uint32_t) batch.n_tokens,
             /*.n_seqs_unq   =*/ (uint32_t) this->seq_id_unq.size(),
             /*.n_pos        =*/ n_pos_per_embd,
+            /*.n_embd       =*/ batch.embd ? n_embd : 0,
             /*.token        =*/ batch.token,
             /*.embd         =*/ batch.embd,
             /*.pos          =*/ batch.pos,
@@ -421,6 +429,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ n_seqs,
         /*.n_pos        =*/ n_pos_per_embd,
+        /*.n_embd       =*/ 0,
 
         /*.token        =*/ udata->token.data(),
         /*.embd         =*/ nullptr,
@@ -822,6 +831,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ (uint32_t) udata->seq_id_unq.size(),
         /*.n_pos        =*/ n_pos_per_embd,
+        /*.n_embd       =*/ batch.embd ? n_embd : 0,
 
         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
         /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
@@ -939,6 +949,7 @@ struct llama_batch llama_batch_get_one(
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*n_embd    =*/ 0,
     };
 }
 
@@ -951,10 +962,12 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*n_embd    =*/ 0,
     };
 
     if (embd) {
         batch.embd = (float *) malloc(sizeof(float) * n_tokens_alloc * embd);
+        batch.n_embd = embd;
     } else {
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_tokens_alloc);
     }

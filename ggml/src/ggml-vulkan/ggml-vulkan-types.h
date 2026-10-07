@@ -268,7 +268,6 @@ struct vk_pipeline_struct {
     // currently only used to compile a 64-bit indexing variant.
     vk_pipeline next;
 };
-
 typedef std::weak_ptr<vk_pipeline_struct> vk_pipeline_ref;
 
 struct vk_matmul_pipeline_key {
@@ -1429,4 +1428,3 @@ struct ggml_backend_vk_device_context {
     std::string pci_bus_id;
     int op_offload_min_batch_size;
 };
-

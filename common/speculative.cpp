@@ -635,6 +635,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 /*.n_seq_id =*/ nullptr,
                 /*.seq_id   =*/ nullptr,
                 /*.logits   =*/ nullptr,
+                /*.n_embd   =*/ n_embd_enc,
             };
             const int32_t rc = llama_encode(ctx_dft, enc_batch);
             if (rc != 0) {
@@ -2499,6 +2500,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
+
+    // the MoE cache is only used by the target context
+    result.moe_cache_size = 0;
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types

@@ -63,15 +63,66 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
+    const size_t nd = llama_model_n_devices(model);
+    std::vector<llama_device_memory_data> ret(nd + 1);
+
+    // Capture the device budgets before constructing the dry-run context.
+    // `no_alloc` prevents model weights from being allocated, but recurrent
+    // state buffers are still allocated by llama_init_from_model. Reading
+    // free memory after that call would subtract the state from `free` and
+    // then add it again through `mb.context`, making the estimator count it
+    // twice. The breakdown below still comes from the context, so only the
+    // free/total snapshot must precede context construction.
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev == nullptr) {
+        llama_model_free(model);
+        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+        throw std::runtime_error("no CPU backend found");
+    }
+
+    size_t host_free;
+    size_t host_total;
+    ggml_backend_dev_memory(cpu_dev, &host_free, &host_total);
+    ret.back().free  = host_free;
+    ret.back().total = host_total;
+
+    for (size_t i = 0; i < nd; i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+
+        size_t free;
+        size_t total;
+        ggml_backend_dev_memory(dev, &free, &total);
+
+        // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
+        // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit
+        // does not assign anything to a device with an unknown memory budget.
+        if (free == 0 && total == 0) {
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                LOG_WRN("%s: device %s did not report memory; --fit will not use it\n",
+                        __func__, ggml_backend_dev_name(dev));
+            } else {
+                free  = host_free;
+                total = host_total;
+            }
+        }
+        ret[i].free  = free;
+        ret[i].total = total;
+    }
+
+    LOG_TRC("%s: memory snapshot captured before dry context: host %6zu total, %6zu free MiB\n",
+            __func__, host_total / (1024 * 1024), host_free / (1024 * 1024));
+    for (size_t i = 0; i < nd; i++) {
+        LOG_TRC("%s: device %zu memory snapshot captured before dry context: %6" PRId64 " total, %6" PRId64 " free MiB\n",
+                __func__, i, ret[i].total / (1024 * 1024), ret[i].free / (1024 * 1024));
+    }
+
     llama_context * ctx = llama_init_from_model(model, *cparams);
     if (ctx == nullptr) {
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
     }
-
-    const size_t nd = llama_model_n_devices(model);
-    std::vector<llama_device_memory_data> ret(nd + 1);
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
@@ -97,39 +148,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
     }
 
-    {
-        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (cpu_dev == nullptr) {
-            throw std::runtime_error("no CPU backend found");
-        }
-        size_t free;
-        size_t total;
-        ggml_backend_dev_memory(cpu_dev, &free, &total);
-        ret.back().free  = free;
-        ret.back().total = total;
-    }
-    for (size_t i = 0; i < nd; i++) {
-        ggml_backend_dev_t dev = llama_model_get_device(model, i);
-
-        size_t free;
-        size_t total;
-        ggml_backend_dev_memory(dev, &free, &total);
-
-        // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
-        // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
-        // not assign anything to a device with an unknown memory budget.
-        if (free == 0 && total == 0) {
-            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                LOG_WRN("%s: device %s did not report memory; --fit will not use it\n",
-                        __func__, ggml_backend_dev_name(dev));
-            } else {
-                free  = ret.back().free;
-                total = ret.back().total;
-            }
-        }
-        ret[i].free  = free;
-        ret[i].total = total;
+    for (size_t i = 0; i < nd + 1; i++) {
+        LOG_TRC("%s: device %zu dry breakdown: model %zu, context %zu, compute %zu MiB; projected %zu MiB\n",
+                __func__, i, ret[i].mb.model / (1024 * 1024), ret[i].mb.context / (1024 * 1024),
+                ret[i].mb.compute / (1024 * 1024), ret[i].mb.total() / (1024 * 1024));
     }
 
     devs.clear();
@@ -333,7 +355,8 @@ static void common_params_fit_impl(
             const llama_device_memory_data & dmd = dmds_full[id];
 
             const int64_t projected_used = dmd.mb.total();
-            const int64_t projected_free = dmd.free - projected_used;
+            const int64_t projected_free = common_fit_projected_free(
+                dmd.free, dmd.mb.model, dmd.mb.context, dmd.mb.compute);
             projected_free_per_device.push_back(projected_free);
 
             sum_free            += dmd.free;

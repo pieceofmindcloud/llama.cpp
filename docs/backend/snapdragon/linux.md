@@ -22,7 +22,6 @@ Build and deploy for a Linux target (using SSH deployment alias `lnx` or `linux`
 ```
 $ ./scripts/snapdragon/build.py --target lnx:user@host --push
 ```
-
 ### Manual CMake Build
 
 Alternatively, you can build llama.cpp manually by entering the cross-compilation Docker container and running the CMake commands:
@@ -90,4 +89,3 @@ Alternatively, you can run the binary directly on the device:
 ```
 $ ./bin/llama-cli -m Llama-3.2-3B-Instruct-Q4_0.gguf --device HTP0 -ngl 99 -p "what is the most popular cookie in the world?"
 ```
-

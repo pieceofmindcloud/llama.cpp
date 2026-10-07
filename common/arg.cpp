@@ -2547,6 +2547,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_parallel = value;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-seqs"}, "N",
+            string_format("sequences reserved for the /decision endpoint, above the slots; enables it (default: %d = disabled, minimum 3)", params.n_seq_decision),
+            [](common_params & params, int value) {
+                if (value != 0 && value < 3) {
+                    throw std::invalid_argument("--decision-seqs needs at least 3 (cached prefix, trunk, one branch)");
+                }
+                params.n_seq_decision = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",
@@ -2705,9 +2715,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
-        "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
-        "- auto: on, but only for tensors larger than 4 GiB\n"
-        "- off: always keep them resident",
+        "- on: read the rows of such tensors from disk on demand instead of keeping them resident\n"
+        "- auto: on only for tensors larger than 4 GiB\n"
+        "- off: always keep them resident\n"
+        "note: --check-tensors and --load-mode mmap+mlock force this option to 'off'",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
             else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
@@ -2769,6 +2780,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-cache-mib"}, "N",
+        "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_size = (size_t) value*1024*1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

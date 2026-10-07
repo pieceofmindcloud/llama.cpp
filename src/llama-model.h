@@ -16,6 +16,7 @@
 
 struct llama_cparams;
 struct llama_ubatch;
+struct llama_lazy_reader_factory;
 struct llama_model_loader;
 
 // available models
@@ -231,6 +232,12 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+
+    // qwen4exp: the MTP head's own final hyper-connection mixer, which stands in for both
+    // the stream collapse and the output norm (the trunk has no separate output_norm either)
+    struct ggml_tensor * hc_head_norm          = nullptr;
+    struct ggml_tensor * hc_head_down          = nullptr;
+    struct ggml_tensor * hc_head_up            = nullptr;
 };
 
 struct llama_layer_switch_lora {
@@ -715,6 +722,11 @@ struct llama_model {
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
+    // The per-layer ownership list is copied from the public load parameters
+    // so its caller-owned storage may be released after model loading.
+    std::vector<uint8_t> external_moe_executor_layers;
+    std::unique_ptr<llama_lazy_reader_factory> lazy_reader_factory;
+
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 
@@ -749,6 +761,14 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+
+    bool uses_external_moe_executor() const;
+
+    bool uses_external_moe_executor_layer(int il) const;
+
+    const uint8_t * external_moe_executor_layers_data() const;
+
+    size_t external_moe_executor_layers_count() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
@@ -822,6 +842,8 @@ struct llama_model_base : public llama_model {
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;
     void load_arch_tensors(llama_model_loader & ml) override = 0;
+
+    void add_lazy_reader(llama_model_loader & ml, const ggml_tensor * t);
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override = 0;
 };
 

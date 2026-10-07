@@ -124,7 +124,6 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
     }
     return vk_device_architecture::OTHER;
 }
-
 bool ggml_vk_lightning_indexer_k_type_supported(ggml_type type) {
     return std::find(lightning_indexer_k_types.begin(), lightning_indexer_k_types.end(), type) != lightning_indexer_k_types.end();
 }
@@ -16104,4 +16103,3 @@ void ggml_vk_debug_label::begin(vk_context & ctx, const std::string & name) {
     subctx->debug_labels.push_back(name);
     ggml_vk_cmd_label_begin(subctx->s->buffer->buf, subctx->debug_labels.back().c_str());
 }
-

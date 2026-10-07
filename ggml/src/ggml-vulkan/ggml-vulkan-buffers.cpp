@@ -179,7 +179,6 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     return buf;
 }
-
 vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::MemoryPropertyFlags req_flags, vk::MemoryPropertyFlags fallback_flags) {
     try {
         return ggml_vk_create_buffer(device, size, {req_flags, fallback_flags});
@@ -780,4 +779,3 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
 
     return buf;
 }
-

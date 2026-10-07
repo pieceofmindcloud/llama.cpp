@@ -1,6 +1,8 @@
 #include "llama-graph.h"
 
+#include "llama-context.h"
 #include "llama-impl.h"
+#include "llama-lazy-reader.h"
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
@@ -16,13 +18,33 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <atomic>
+#include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+
+ggml_tensor * llama_moe_reshape_route_2d(
+        ggml_context * ctx,
+        ggml_tensor * tensor,
+        int64_t       ne0,
+        int64_t       ne1) {
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(tensor != nullptr);
+
+    // The route crosses from the backend that computes top-k/gather to the
+    // CPU custom op. A stride check is not enough here: a tensor can describe
+    // a contiguous layout while its producer allocation has not been
+    // materialized for the scheduler copy yet. Force a concrete producer for
+    // every route, including the first token/slot, before reshaping it.
+    tensor = ggml_cont(ctx, tensor);
+    return ggml_reshape_2d(ctx, tensor, ne0, ne1);
+}
 
 // dedup helpers
 
@@ -66,6 +88,49 @@ static bool can_reuse_kq_mask(
 
 // impl
 
+ggml_tensor * llm_graph_lazy_rows::build(ggml_context * ctx0, ggml_tensor * table,
+                                         const llama_lazy_reader * reader, int64_t n_rows) {
+    this->table = table;
+    this->reader = reader;
+
+    if (!reader) {
+        t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
+        ggml_set_input(t);
+
+        return ggml_get_rows(ctx0, table, t);
+    }
+
+    t = ggml_new_tensor_2d(ctx0, table->type, table->ne[0], n_rows);
+    ggml_set_input(t);
+    t_indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
+    ggml_set_input(t_indices);
+    identity.resize(n_rows);
+    for (int64_t i = 0; i < n_rows; ++i) {
+        identity[i] = (int32_t) i;
+    }
+
+    return ggml_get_rows(ctx0, t, t_indices);
+}
+
+void llm_graph_lazy_rows::set_rows(const int32_t * idx, int64_t n) {
+    GGML_ASSERT(can_reuse(n));
+
+    if (!reader) {
+        ggml_backend_tensor_set(t, idx, 0, n*ggml_element_size(t));
+        return;
+    }
+
+    staging.resize(n*ggml_row_size(table->type, table->ne[0]));
+    reader->gather(table, idx, n, staging.data());
+
+    ggml_backend_tensor_set(t, staging.data(), 0, staging.size());
+    ggml_backend_tensor_set(t_indices, identity.data(), 0, n*sizeof(int32_t));
+}
+
+bool llm_graph_lazy_rows::can_reuse(int64_t n_rows) const {
+    return t && n_rows == (reader ? t->ne[1] : t->ne[0]);
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -75,6 +140,7 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
 
     if (ubatch->embd) {
         GGML_ASSERT(n_embd == embd->ne[0]);
+        GGML_ASSERT(ubatch->n_embd == 0 || n_embd == ubatch->n_embd);
 
         const int64_t n_tokens = ubatch->n_tokens;
 
@@ -86,7 +152,9 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || (embd &&
+            (!params.ubatch.n_embd || embd->ne[0] == params.ubatch.n_embd) &&
+            embd->ne[1] == params.ubatch.n_tokens);
 
     return res;
 }
@@ -118,8 +186,12 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || (embd &&
+            (!params.ubatch.n_embd || embd->ne[0] == params.ubatch.n_embd) &&
+            embd->ne[1] == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || (h &&
+            (!params.ubatch.n_embd || h->ne[0] == params.ubatch.n_embd) &&
+            h->ne[1] == params.ubatch.n_tokens);
 
     return res;
 }
@@ -1456,6 +1528,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     arch             (params.arch),
     hparams          (params.hparams),
     cparams          (params.cparams),
+    context          (params.context),
     ubatch           (params.ubatch),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
@@ -1485,6 +1558,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     rope_type        (hparams.rope_type),
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
+    lazy_reader_ctx  (params.lazy_reader),
     cvec             (params.cvec),
     loras            (params.loras),
     mctx             (params.mctx),
@@ -1496,6 +1570,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     gf               (res->get_gf()) {
         res->set_params(params);
     }
+
+const llama_lazy_reader * llm_graph_context::lazy_reader(const ggml_tensor * t) const {
+    return lazy_reader_ctx && lazy_reader_ctx->has(t) ? lazy_reader_ctx : nullptr;
+}
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
@@ -1744,6 +1822,16 @@ llm_graph_qkv llm_graph_context::build_qkv(
     return { Qcur, Kcur, Vcur };
 }
 
+// Tensor parallelism reduce (no weight transfer). No-op when no callback is set.
+static ggml_tensor * tp_reduce(ggml_context * ctx, ggml_tensor * cur) {
+    if (!llama_tp_reduce_enabled()) {
+        return cur;
+    }
+    ggml_tensor * args[1] = { cur };
+    return ggml_custom_4d(ctx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3],
+                          args, 1, llama_tp_reduce_fun, 1, nullptr);
+}
+
 
 ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * cur,
@@ -1943,7 +2031,267 @@ ggml_tensor * llm_graph_context::build_ffn(
         cb(cur, "ffn_down_s", il);
     }
 
+    cur = tp_reduce(ctx0, cur);
+
     return cur;
+}
+
+static void llama_moe_copy_string(char * dst, size_t dst_size, const char * src) {
+    if (dst_size == 0) {
+        return;
+    }
+    std::strncpy(dst, src == nullptr ? "" : src, dst_size - 1);
+    dst[dst_size - 1] = '\0';
+}
+
+static void llama_moe_describe_tensor(
+        llama_moe_tensor_descriptor * descriptor,
+        const ggml_tensor           * tensor) {
+    std::memset(descriptor, 0, sizeof(*descriptor));
+    if (tensor == nullptr) {
+        return;
+    }
+    descriptor->present = 1;
+    descriptor->dtype = static_cast<int32_t>(tensor->type);
+    descriptor->n_dims = static_cast<uint32_t>(ggml_n_dims(tensor));
+    for (uint32_t i = 0; i < GGML_MAX_DIMS; ++i) {
+        descriptor->ne[i] = tensor->ne[i];
+    }
+    llama_moe_copy_string(descriptor->name, sizeof(descriptor->name), ggml_get_name(tensor));
+}
+
+static int llama_moe_layer_from_name(const ggml_tensor * tensor) {
+    const char * name = tensor == nullptr ? nullptr : ggml_get_name(tensor);
+    const char * dash = name == nullptr ? nullptr : strrchr(name, '-');
+    char * end = nullptr;
+    const long layer = dash == nullptr ? -1 : std::strtol(dash + 1, &end, 10);
+    return dash != nullptr && end != dash + 1 && *end == '\0' && layer >= 0 && layer <= INT32_MAX
+        ? static_cast<int>(layer)
+        : -1;
+}
+
+// POM_MOE_ROUTE_COPY_TRACE is intentionally the only switch for this trace.
+// The legacy value "1" means layer 0; use "layer=1" for layer 1 because the
+// legacy value and the layer number otherwise collide.
+static int llama_moe_route_trace_layer() {
+    static const int layer = [] {
+        const char * raw = std::getenv("POM_MOE_ROUTE_COPY_TRACE");
+        if (raw == nullptr || *raw == '\0') {
+            return -1;
+        }
+        if (std::strcmp(raw, "1") == 0 || std::strcmp(raw, "true") == 0 ||
+                std::strcmp(raw, "yes") == 0 || std::strcmp(raw, "on") == 0) {
+            return 0;
+        }
+
+        const char * number = raw;
+        if (std::strncmp(raw, "layer=", 6) == 0 || std::strncmp(raw, "layer:", 6) == 0) {
+            number += 6;
+        }
+        char * end = nullptr;
+        const long value = std::strtol(number, &end, 10);
+        if (end == number || *end != '\0' || value < 0 || value > INT32_MAX) {
+            return -1;
+        }
+        return static_cast<int>(value);
+    }();
+    return layer;
+}
+
+bool llama_moe_route_trace_layer_name(const char * name, int layer) {
+    if (name == nullptr || layer < 0) {
+        return false;
+    }
+
+    for (const char * prefix : {"ffn_moe_topk-", "ffn_moe_weights-"}) {
+        const char * match = std::strstr(name, prefix);
+        if (match == nullptr) {
+            continue;
+        }
+
+        char * end = nullptr;
+        const long parsed_layer = std::strtol(match + std::strlen(prefix), &end, 10);
+        if (end != match + std::strlen(prefix) && parsed_layer == layer &&
+                (*end == '\0' || *end == ' ' || *end == '(')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void llama_moe_trace_callback_route(
+        int                 layer,
+        const ggml_tensor * dst,
+        const ggml_tensor * selected_experts,
+        const ggml_tensor * weights) {
+    if (layer < 0 || layer != llama_moe_route_trace_layer()) {
+        return;
+    }
+
+    static std::atomic<bool> emitted = false;
+    if (emitted.exchange(true)) {
+        return;
+    }
+
+    const char * dst_name = dst == nullptr ? "<null>" : ggml_get_name(dst);
+    const char * selected_name = selected_experts == nullptr ? "<null>" : ggml_get_name(selected_experts);
+    const char * weights_name = weights == nullptr ? "<null>" : ggml_get_name(weights);
+    if (selected_experts == nullptr || weights == nullptr ||
+            selected_experts->data == nullptr || weights->data == nullptr ||
+            selected_experts->type != GGML_TYPE_I32 || weights->type != GGML_TYPE_F32) {
+        LLAMA_LOG_WARN(
+            "POM_MOE_ROUTE_COPY_TRACE callback layer=%d dst=%s selected_src=%s selected_ptr=%p selected_values=<unavailable> weights_src=%s weights_ptr=%p weights_values=<unavailable>\n",
+            layer,
+            dst_name,
+            selected_name,
+            selected_experts == nullptr ? nullptr : selected_experts->data,
+            weights_name,
+            weights == nullptr ? nullptr : weights->data);
+        return;
+    }
+
+    const size_t selected_count = std::min<size_t>(4, static_cast<size_t>(ggml_nelements(selected_experts)));
+    const size_t weights_count = std::min<size_t>(4, static_cast<size_t>(ggml_nelements(weights)));
+    std::ostringstream selected_values;
+    std::ostringstream weights_values;
+    for (size_t i = 0; i < selected_count; ++i) {
+        if (i != 0) {
+            selected_values << ',';
+        }
+        selected_values << static_cast<const int32_t *>(selected_experts->data)[i];
+    }
+    for (size_t i = 0; i < weights_count; ++i) {
+        if (i != 0) {
+            weights_values << ',';
+        }
+        weights_values << static_cast<const float *>(weights->data)[i];
+    }
+
+    LLAMA_LOG_WARN(
+        "POM_MOE_ROUTE_COPY_TRACE callback layer=%d dst=%s selected_src=%s selected_ptr=%p selected_values=[%s] weights_src=%s weights_ptr=%p weights_values=[%s]\n",
+        layer,
+        dst_name,
+        selected_name,
+        selected_experts->data,
+        selected_values.str().c_str(),
+        weights_name,
+        weights->data,
+        weights_values.str().c_str());
+}
+
+static void llama_moe_ffn_custom(
+        ggml_tensor       * dst,
+        const ggml_tensor * hidden,
+        const ggml_tensor * selected_experts,
+        const ggml_tensor * weights,
+        int                 ith,
+        int                 nth,
+        void              * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+
+    auto * ctx = static_cast<const llama_context *>(userdata);
+    const auto & cparams = ctx->get_cparams();
+    const int layer = llama_moe_layer_from_name(dst);
+    llama_moe_trace_callback_route(layer, dst, selected_experts, weights);
+    const auto * descriptor = ctx->get_moe_ffn_descriptor(layer);
+    const size_t hidden_width = hidden == nullptr ? 0 : static_cast<size_t>(hidden->ne[0]);
+    const size_t n_tokens = hidden == nullptr ? 0 : static_cast<size_t>(hidden->ne[1]);
+    const bool valid_shape = hidden != nullptr && selected_experts != nullptr && weights != nullptr &&
+        hidden->type == GGML_TYPE_F32 && selected_experts->type == GGML_TYPE_I32 &&
+        weights->type == GGML_TYPE_F32 && ggml_is_contiguous(hidden) &&
+        ggml_is_contiguous(selected_experts) && ggml_is_contiguous(weights) &&
+        selected_experts->ne[0] == static_cast<int64_t>(descriptor == nullptr ? 0 : descriptor->expert_count_used) &&
+        selected_experts->ne[1] == static_cast<int64_t>(n_tokens) &&
+        weights->ne[0] == selected_experts->ne[0] && weights->ne[1] == selected_experts->ne[1] &&
+        dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst);
+
+    bool ok = cparams.cb_moe_ffn != nullptr && valid_shape && descriptor != nullptr;
+    if (cparams.cb_moe_ffn != nullptr) {
+        ok = cparams.cb_moe_ffn(
+            cparams.cb_moe_ffn_user_data,
+            descriptor,
+            valid_shape ? static_cast<const float *>(hidden->data) : nullptr,
+            valid_shape ? static_cast<const int32_t *>(selected_experts->data) : nullptr,
+            valid_shape ? static_cast<const float *>(weights->data) : nullptr,
+            n_tokens,
+            hidden_width,
+            static_cast<float *>(dst->data));
+    }
+    if (!ok) {
+        // The Rust bridge records the explicit refusal. Zeroing prevents an
+        // uninitialized graph value from becoming a silent model response;
+        // llama_decode rejects the bridge error at the boundary.
+        std::memset(dst->data, 0, ggml_nbytes(dst));
+    }
+}
+
+ggml_tensor * llm_graph_context::build_moe_ffn_external(
+        ggml_tensor * cur,
+        ggml_tensor * selected_experts,
+        ggml_tensor * weights,
+        ggml_tensor * gate_up_exps,
+        ggml_tensor * gate_exps,
+        ggml_tensor * up_exps,
+        ggml_tensor * down_exps,
+        ggml_tensor * gate_up_exps_b,
+        ggml_tensor * gate_exps_b,
+        ggml_tensor * up_exps_b,
+        ggml_tensor * down_exps_b,
+        ggml_tensor * gate_exps_s,
+        ggml_tensor * up_exps_s,
+        ggml_tensor * down_exps_s,
+        int64_t       n_expert,
+        int64_t       n_expert_used,
+        llm_ffn_op_type type_op,
+        bool          norm_w,
+        float         w_scale,
+        llama_expert_gating_func_type gating_op,
+        bool          weight_before_ffn,
+        int           il) const {
+    const bool external_for_layer = cparams.moe_external_executor &&
+        (cparams.moe_external_executor_layers == nullptr ||
+         (il >= 0 && static_cast<size_t>(il) < cparams.moe_external_executor_layer_count &&
+          cparams.moe_external_executor_layers[il] != 0));
+    if (context == nullptr || (!external_for_layer && cparams.cb_moe_ffn == nullptr)) {
+        return nullptr;
+    }
+
+    llama_moe_ffn_descriptor descriptor = {};
+    llama_moe_copy_string(descriptor.architecture, sizeof(descriptor.architecture), llm_arch_name(arch));
+    descriptor.layer = il;
+    descriptor.activation = static_cast<int32_t>(type_op);
+    descriptor.gating = static_cast<int32_t>(gating_op);
+    descriptor.normalize_weights = norm_w ? 1 : 0;
+    descriptor.weight_before_ffn = weight_before_ffn ? 1 : 0;
+    descriptor.weight_scale = w_scale;
+    descriptor.expert_count = static_cast<uint64_t>(n_expert);
+    descriptor.expert_count_used = static_cast<uint64_t>(n_expert_used);
+    llama_moe_describe_tensor(&descriptor.gate_up, gate_up_exps);
+    llama_moe_describe_tensor(&descriptor.gate, gate_exps);
+    llama_moe_describe_tensor(&descriptor.up, up_exps);
+    llama_moe_describe_tensor(&descriptor.down, down_exps);
+    llama_moe_describe_tensor(&descriptor.gate_up_bias, gate_up_exps_b);
+    llama_moe_describe_tensor(&descriptor.gate_bias, gate_exps_b);
+    llama_moe_describe_tensor(&descriptor.up_bias, up_exps_b);
+    llama_moe_describe_tensor(&descriptor.down_bias, down_exps_b);
+    llama_moe_describe_tensor(&descriptor.gate_scale, gate_exps_s);
+    llama_moe_describe_tensor(&descriptor.up_scale, up_exps_s);
+    llama_moe_describe_tensor(&descriptor.down_scale, down_exps_s);
+    context->set_moe_ffn_descriptor(descriptor);
+
+    auto * external = ggml_map_custom3(
+        ctx0,
+        cur,
+        selected_experts,
+        weights,
+        llama_moe_ffn_custom,
+        1,
+        const_cast<llama_context *>(context));
+    ggml_format_name(external, "ffn_moe_external-%d", il);
+    return external;
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(
@@ -2149,6 +2497,45 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    // This is the single replacement point shared by model builders. The
+    // route is already resolved here, so the external executor receives the
+    // exact expert ids and weights that native llama.cpp would use. Returning
+    // immediately is essential: no native expert matmul is added to the
+    // graph when the opt-in callback is installed.
+    const bool external_for_layer = cparams.moe_external_executor &&
+        (cparams.moe_external_executor_layers == nullptr ||
+         (il >= 0 && static_cast<size_t>(il) < cparams.moe_external_executor_layer_count &&
+          cparams.moe_external_executor_layers[il] != 0));
+    if (external_for_layer || (cparams.cb_moe_ffn != nullptr && !cparams.moe_external_executor)) {
+        ggml_tensor * selected_for_external = llama_moe_reshape_route_2d(
+            ctx0, selected_experts, n_expert_used, n_tokens);
+        ggml_tensor * weights_for_external = llama_moe_reshape_route_2d(
+            ctx0, weights, n_expert_used, n_tokens);
+        return build_moe_ffn_external(
+            cur,
+            selected_for_external,
+            weights_for_external,
+            gate_up_exps,
+            gate_exps,
+            up_exps,
+            down_exps,
+            gate_up_exps_b,
+            gate_exps_b,
+            up_exps_b,
+            down_exps_b,
+            gate_exps_s,
+            up_exps_s,
+            down_exps_s,
+            n_expert,
+            n_expert_used,
+            type_op,
+            norm_w,
+            w_scale,
+            gating_op,
+            weight_before_ffn,
+            il);
     }
 
     //call early so that topk-moe can be used
@@ -2358,17 +2745,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
+    const bool vector_input  = ubatch.embd != nullptr;
+    const int64_t n_embd_input = vector_input && ubatch.n_embd > 0 ? ubatch.n_embd : n_embd_inp;
 
     assert(n_embd_inp >= n_embd);
+    assert(n_embd_input >= n_embd);
 
-    auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    auto inp = std::make_unique<llm_graph_input_embd>(n_embd_input);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
     cb(inp->tokens, "inp_tokens", -1);
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_input, ubatch.n_tokens);
     cb(inp->embd, "inp_embd", -1);
     ggml_set_input(inp->embd);
 
@@ -2400,8 +2790,8 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
             cur = ggml_add(ctx0, cur, inpL_delta);
         }
 
-        if (n_embd_inp != n_embd) {
-            cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+        if (n_embd_input != n_embd) {
+            cur = ggml_pad(ctx0, cur, n_embd_input - n_embd, 0, 0, 0);
         }
     }
 
@@ -2417,7 +2807,8 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token ? 0 : 1);
 
-    if (n_embd_inp != n_embd) {
+    const bool preserve_expanded_input = vector_input && n_embd_input != n_embd_inp;
+    if (n_embd_inp != n_embd && !preserve_expanded_input) {
         cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
     }
 
@@ -2800,6 +3191,8 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    cur = tp_reduce(ctx0, cur);
+
     return cur;
 }
 
@@ -2908,6 +3301,14 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    // Tensor parallelism: a projecao de saida da atencao e row-parallel,
+    // entao cada rank produz uma soma parcial que precisa ser reduzida.
+    // Faltava em todas as sobrecargas com cache KV - so a variante
+    // no_cache tinha o reduce -, e um modelo de 32 camadas somava 32 vezes
+    // em vez de 64: FFN reduzido, atencao nao. A resposta saia fluente e
+    // sem sentido, que e o disfarce mais perigoso deste defeito.
+    cur = tp_reduce(ctx0, cur);
+
     return cur;
 }
 
@@ -2995,6 +3396,14 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    // Tensor parallelism: a projecao de saida da atencao e row-parallel,
+    // entao cada rank produz uma soma parcial que precisa ser reduzida.
+    // Faltava em todas as sobrecargas com cache KV - so a variante
+    // no_cache tinha o reduce -, e um modelo de 32 camadas somava 32 vezes
+    // em vez de 64: FFN reduzido, atencao nao. A resposta saia fluente e
+    // sem sentido, que e o disfarce mais perigoso deste defeito.
+    cur = tp_reduce(ctx0, cur);
+
     return cur;
 }
 
@@ -3070,6 +3479,14 @@ ggml_tensor * llm_graph_context::build_attn(
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
+
+    // Tensor parallelism: a projecao de saida da atencao e row-parallel,
+    // entao cada rank produz uma soma parcial que precisa ser reduzida.
+    // Faltava em todas as sobrecargas com cache KV - so a variante
+    // no_cache tinha o reduce -, e um modelo de 32 camadas somava 32 vezes
+    // em vez de 64: FFN reduzido, atencao nao. A resposta saia fluente e
+    // sem sentido, que e o disfarce mais perigoso deste defeito.
+    cur = tp_reduce(ctx0, cur);
 
     return cur;
 }
@@ -3158,6 +3575,14 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    // Tensor parallelism: a projecao de saida da atencao e row-parallel,
+    // entao cada rank produz uma soma parcial que precisa ser reduzida.
+    // Faltava em todas as sobrecargas com cache KV - so a variante
+    // no_cache tinha o reduce -, e um modelo de 32 camadas somava 32 vezes
+    // em vez de 64: FFN reduzido, atencao nao. A resposta saia fluente e
+    // sem sentido, que e o disfarce mais perigoso deste defeito.
+    cur = tp_reduce(ctx0, cur);
+
     return cur;
 }
 
@@ -3225,6 +3650,14 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    // Tensor parallelism: a projecao de saida da atencao e row-parallel,
+    // entao cada rank produz uma soma parcial que precisa ser reduzida.
+    // Faltava em todas as sobrecargas com cache KV - so a variante
+    // no_cache tinha o reduce -, e um modelo de 32 camadas somava 32 vezes
+    // em vez de 64: FFN reduzido, atencao nao. A resposta saia fluente e
+    // sem sentido, que e o disfarce mais perigoso deste defeito.
+    cur = tp_reduce(ctx0, cur);
+
     return cur;
 }
 
@@ -3283,6 +3716,14 @@ ggml_tensor * llm_graph_context::build_attn(
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
+
+    // Tensor parallelism: a projecao de saida da atencao e row-parallel,
+    // entao cada rank produz uma soma parcial que precisa ser reduzida.
+    // Faltava em todas as sobrecargas com cache KV - so a variante
+    // no_cache tinha o reduce -, e um modelo de 32 camadas somava 32 vezes
+    // em vez de 64: FFN reduzido, atencao nao. A resposta saia fluente e
+    // sem sentido, que e o disfarce mais perigoso deste defeito.
+    cur = tp_reduce(ctx0, cur);
 
     return cur;
 }

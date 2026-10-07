@@ -7,8 +7,10 @@
 #include "../src/llama-vocab.h"
 
 #include <cstdlib>
+#include <array>
 #include <initializer_list>
 #include <map>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -389,6 +391,28 @@ static void test_split(testing & t) {
         t.assert_equal(6u, ba.get_n_used());
     });
 
+    t.test("split_equal_does_not_overfill_microbatch", [&](testing & t) {
+        constexpr uint32_t n_seqs = 6;
+        constexpr uint32_t n_ubatch = 512;
+
+        batch_builder bb;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seqs; ++seq_id) {
+            // 86 * 6 = 516. This is the first full equal split above 512
+            // when the active sequence count does not divide the limit.
+            for (int i = 0; i < 86; ++i) {
+                bb.add(i, {seq_id}, i == 85);
+            }
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, n_seqs, false));
+
+        const llama_ubatch ub = ba.split_equal(n_ubatch, false, 0);
+        t.assert_equal("all active sequences are retained", n_seqs, ub.n_seqs);
+        t.assert_true("equal split fits the configured microbatch", ub.n_tokens <= n_ubatch);
+        t.assert_equal("split remains rectangular", 0u, ub.n_tokens % ub.n_seqs);
+    });
+
     t.test("split_equal_coupled", [&](testing & t) {
         batch_builder bb;
         bb.add(0, {0, 1}, false);
@@ -650,6 +674,90 @@ static void test_mrope(testing & t) {
     });
 }
 
+static void test_large_context_multi_sequence(testing & t) {
+    llama_vocab vocab;
+
+    t.test("large_context_six_sequence_repeated_split", [&](testing & t) {
+        constexpr llama_seq_id n_seqs = 6;
+        constexpr int n_tokens_per_seq = 516;
+        constexpr uint32_t n_ubatch = 512;
+        constexpr uint32_t n_keep_tail = 6;
+        constexpr llama_pos context_tail = 750000;
+
+        batch_builder bb;
+        for (llama_seq_id seq_id = 0; seq_id < n_seqs; ++seq_id) {
+            for (int i = 0; i < n_tokens_per_seq; ++i) {
+                bb.add(context_tail + i, {seq_id}, i == n_tokens_per_seq - 1);
+            }
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, n_seqs, false));
+
+        uint32_t n_ubatches = 0;
+        while (true) {
+            llama_ubatch ub = ba.split_equal(n_ubatch, false, n_keep_tail);
+            if (ub.n_tokens == 0) {
+                break;
+            }
+
+            t.assert_true("equal split never exceeds the microbatch", ub.n_tokens <= n_ubatch);
+            t.assert_true("equal split has a valid sequence divisor", ub.n_seqs > 0 && ub.n_tokens % ub.n_seqs == 0);
+            t.assert_equal("all active sequences advance equally", ub.n_seq_tokens * ub.n_seqs, ub.n_tokens);
+            t.assert_true("all positions remain in the large context", ub.pos[0] >= context_tail);
+            ++n_ubatches;
+            t.assert_true("split loop makes progress", n_ubatches <= 32);
+        }
+
+        t.assert_equal("all six long sequences are consumed", (uint32_t) bb.seq.size(), ba.get_n_used());
+        t.assert_true("large context needs more than one ubatch", n_ubatches > 1);
+    });
+}
+
+static void test_split_equal_fuzz_shapes(testing & t) {
+    llama_vocab vocab;
+
+    t.test("split_equal_random_valid_shapes", [&](testing & t) {
+        std::mt19937 rng(0x750000u);
+        constexpr std::array<uint32_t, 5> ubatch_sizes = { 6, 16, 96, 512, 516 };
+
+        for (uint32_t iteration = 0; iteration < 256; ++iteration) {
+            const uint32_t n_seqs = 1 + rng() % 6;
+            const uint32_t n_ubatch = ubatch_sizes[rng() % ubatch_sizes.size()];
+            // split_equal requires the tail budget to be smaller than the
+            // physical ubatch size. Keep generated cases within that API
+            // precondition, including the small n_ubatch=6 case.
+            const uint32_t n_keep_tail = 1 + rng() % std::min<uint32_t>(8, n_ubatch - 1);
+
+            batch_builder bb;
+            for (uint32_t seq_id = 0; seq_id < n_seqs; ++seq_id) {
+                const uint32_t length = 1 + rng() % 130;
+                for (uint32_t i = 0; i < length; ++i) {
+                    bb.add(750000 + i, {(llama_seq_id) seq_id}, i + 1 == length);
+                }
+            }
+
+            llama_batch_allocr ba(1);
+            t.assert_true("large-context shape is accepted", ba.init(bb.make(), vocab, nullptr, bb.n_embd, n_seqs, false));
+
+            uint32_t previous_used = 0;
+            while (true) {
+                llama_ubatch ub = ba.split_equal(n_ubatch, false, n_keep_tail);
+                if (ub.n_tokens == 0) {
+                    break;
+                }
+
+                t.assert_true("random equal split respects n_ubatch", ub.n_tokens <= n_ubatch);
+                t.assert_true("random equal split is divisible", ub.n_seqs > 0 && ub.n_tokens % ub.n_seqs == 0);
+                t.assert_true("random equal split makes progress", ba.get_n_used() > previous_used);
+                previous_used = ba.get_n_used();
+            }
+
+            t.assert_equal("random equal split consumes the batch", (uint32_t) bb.seq.size(), ba.get_n_used());
+        }
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -669,6 +777,8 @@ int main(int argc, char ** argv) {
     t.test("split",     test_split);
     t.test("keep_tail", test_keep_tail);
     t.test("mrope",     test_mrope);
+    t.test("large_context_multi_sequence", test_large_context_multi_sequence);
+    t.test("split_equal_fuzz_shapes", test_split_equal_fuzz_shapes);
 
     return t.summary();
 }

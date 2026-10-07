@@ -110,6 +110,15 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// Opt-in replacement for a model-specific MoE FFN. The callback runs at the
+// point where the graph would call build_moe_ffn and receives the normalized
+// expert input plus the router logits already calculated by llama.cpp. A null
+// callback restores the model's native expert implementation.
+LLAMA_API void llama_set_moe_ffn_callback(
+        struct llama_context * ctx,
+        llama_moe_ffn_callback callback,
+        void * userdata);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);

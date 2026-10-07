@@ -53,6 +53,16 @@ struct common_device_memory_data {
     size_t  compute;
 };
 
+// The free value is captured before the dry-run context is created. Its
+// context buffers therefore belong in the projection exactly once.
+inline int64_t common_fit_projected_free(
+        int64_t free_bytes, size_t model, size_t context, size_t compute) {
+    return free_bytes
+        - static_cast<int64_t>(model)
+        - static_cast<int64_t>(context)
+        - static_cast<int64_t>(compute);
+}
+
 using common_device_memory_data_vec = std::vector<common_device_memory_data>;
 
 // Load a model + context with no_alloc and return the per-device memory breakdown.

@@ -6,6 +6,10 @@
 #include <type_traits>
 #include <vector>
 
+// tensor parallelism reduce (no weight transfer)
+bool llama_tp_reduce_enabled();
+void llama_tp_reduce_fun(ggml_tensor * dst, int ith, int nth, void * userdata);
+
 #ifdef __GNUC__
 #    if defined(__MINGW32__) && !defined(__clang__)
 #        define LLAMA_ATTRIBUTE_FORMAT(...) __attribute__((format(gnu_printf, __VA_ARGS__)))
