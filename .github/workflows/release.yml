@@ -842,6 +842,15 @@ jobs:
       - name: Pack artifacts
         id: pack_artifacts
         run: |
+          # POM links llama.cpp from this package: ship the MSVC import
+          # libraries next to their DLLs (the backend zips get them too, since
+          # the cpu zip is injected into every one of them).
+          Get-ChildItem -Path build -Recurse -Include llama.lib,ggml.lib,ggml-base.lib,llama-common.lib,mtmd.lib |
+            Where-Object { $_.FullName -notmatch 'CMakeFiles' } |
+            Copy-Item -Destination .\build\bin\Release\ -Force
+          foreach ($lib in 'llama.lib','ggml.lib','ggml-base.lib','llama-common.lib') {
+            if (-not (Test-Path ".\build\bin\Release\$lib")) { throw "missing import library $lib" }
+          }
           7z a -snl llama-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
@@ -1781,6 +1790,24 @@ jobs:
             rm -rf "$temp_dir"
           done
 
+          # CUDA 13.4 + Vulkan in one package. The backends are loadable modules
+          # (GGML_BACKEND_DL), so the CUDA package plus the Vulkan module is a
+          # build with both: NVIDIA through CUDA, AMD/Intel through Vulkan.
+          echo "Building the combined CUDA 13.4 + Vulkan packages..."
+          combined_win="$(realpath artifact)/llama-bin-win-cuda-13.4-vulkan-x64.zip"
+          cp artifact/llama-bin-win-cuda-13.4-x64.zip "$combined_win"
+          vk_dir=$(mktemp -d)
+          unzip -j artifact/llama-bin-win-vulkan-x64.zip 'ggml-vulkan.dll' -d "$vk_dir"
+          (cd "$vk_dir" && zip "$combined_win" ggml-vulkan.dll)
+          rm -rf "$vk_dir"
+
+          tag="${{ steps.tag.outputs.name }}"
+          linux_dir=$(mktemp -d)
+          tar -xzf "artifact/llama-${tag}-bin-ubuntu-cuda-13.4-x64.tar.gz" -C "$linux_dir"
+          tar -xzf "artifact/llama-${tag}-bin-ubuntu-vulkan-x64.tar.gz" -C "$linux_dir" --wildcards '*/libggml-vulkan*'
+          tar -czf "artifact/llama-${tag}-bin-ubuntu-cuda-13.4-vulkan-x64.tar.gz" -C "$linux_dir" "llama-${tag}"
+          rm -rf "$linux_dir"
+
           echo "Renaming and moving zips to release..."
           for zip_file in artifact/llama-bin-win-*.zip; do
             base_name=$(basename "$zip_file" .zip)
@@ -1855,6 +1882,7 @@ jobs:
             - [Ubuntu arm64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-arm64.tar.gz)
             - [Ubuntu x64 (CUDA 12)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-12.8-x64.tar.gz) - [CUDA 12.8 libraries](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-12.8-x64.tar.gz)
             - [Ubuntu x64 (CUDA 13.4)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.4-x64.tar.gz) - [CUDA 13.4 libraries](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.4-x64.tar.gz)
+            - [Ubuntu x64 (CUDA 13.4 + Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.4-vulkan-x64.tar.gz) - [CUDA 13.4 libraries](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.4-x64.tar.gz)
             - [Ubuntu x64 (CUDA 13)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.3-x64.tar.gz) - [CUDA 13.3 libraries](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.3-x64.tar.gz)
             - [Ubuntu arm64 (CUDA 13)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.3-arm64.tar.gz) - [CUDA 13.3 libraries](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-13.3-arm64.tar.gz)
             - [Ubuntu x64 (ROCm 10.0)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-rocm-10.0-x64.tar.gz)
@@ -1872,6 +1900,7 @@ jobs:
             - [Windows x64 (CUDA 12)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-12.4-x64.zip) - [CUDA 12.4 DLLs](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-bin-win-cuda-12.4-x64.zip)
             - [Windows x64 (CUDA 13)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.4-x64.zip) - [CUDA 13.4 DLLs](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-bin-win-cuda-13.4-x64.zip)
             - [Windows arm64 (CUDA 13)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.4-arm64.zip) - [CUDA 13.4 DLLs](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-bin-win-cuda-13.4-arm64.zip)
+            - [Windows x64 (CUDA 13.4 + Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.4-vulkan-x64.zip) - [CUDA 13.4 DLLs](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-bin-win-cuda-13.4-x64.zip)
             - [Windows x64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip)
             - [Windows x64 (OpenVINO)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-openvino-${{ needs.windows-openvino.outputs.openvino_version }}-x64.zip)
             - [Windows x64 (SYCL)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-sycl-x64.zip)
@@ -1908,15 +1937,3 @@ jobs:
                 });
               }
             }
-
-  ui-publish:
-    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
-
-    needs:
-      - release
-
-    uses: ./.github/workflows/ui-publish.yml
-    with:
-      version_tag: ${{ needs.release.outputs.tag_name }}
-    secrets:
-      hf_token: ${{ secrets.HF_TOKEN_UI_STATIC_OUTPUT }}
