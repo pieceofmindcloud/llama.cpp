@@ -178,8 +178,6 @@ jobs:
             os: ubuntu-22.04
           - build: 'arm64'
             os: ubuntu-24.04-arm
-          - build: 's390x'
-            os: ubuntu-24.04-s390x
 
     runs-on: ${{ matrix.os }}
 
@@ -210,7 +208,6 @@ jobs:
           echo "CXX=g++-14" >> "$GITHUB_ENV"
 
       - name: ccache
-        if: ${{ matrix.build != 's390x' }}
         uses: ggml-org/ccache-action@v1.2.24
         with:
           key: release-${{ matrix.os }}-cpu
@@ -242,7 +239,6 @@ jobs:
           archive: false
 
       - name: ccache-clear
-        if: ${{ matrix.build != 's390x' }}
         uses: ./.github/actions/ccache-clear
         with:
           key: release-${{ matrix.os }}-cpu
@@ -922,6 +918,15 @@ jobs:
       - name: Pack artifacts
         id: pack_artifacts
         run: |
+          # POM links llama.cpp from this package: ship the MSVC import
+          # libraries next to their DLLs (the backend zips get them too, since
+          # the cpu zip is injected into every one of them).
+          Get-ChildItem -Path build -Recurse -Include llama.lib,ggml.lib,ggml-base.lib,llama-common.lib,mtmd.lib |
+            Where-Object { $_.FullName -notmatch 'CMakeFiles' } |
+            Copy-Item -Destination .\build\bin\Release\ -Force
+          foreach ($lib in 'llama.lib','ggml.lib','ggml-base.lib','llama-common.lib') {
+            if (-not (Test-Path ".\build\bin\Release\$lib")) { throw "missing import library $lib" }
+          }
           7z a -snl llama-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
