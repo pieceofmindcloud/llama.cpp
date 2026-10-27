@@ -597,12 +597,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     // the MTP head reads the hc-wide residual, before the final mixer
-    res->t_h_nextn = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+    // count the rows from the element count, ne[2] alone drops the n_seqs factor of a multi-sequence ubatch
+    const int64_t res_hc_rows = ggml_nelements(res_hc) / (n_embd*hc);
+    res->t_h_nextn = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc_rows);
     cb(res->t_h_nextn, "h_nextn", -1);
     ggml_build_forward_expand(gf, res->t_h_nextn);
 
     if (crop_after_nextn(inp_out_ids)) {
-        res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+        res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc_rows);
         res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
         res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
     }
