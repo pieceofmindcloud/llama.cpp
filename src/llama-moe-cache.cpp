@@ -312,6 +312,23 @@ struct llama_moe_cache::impl {
             return res;
         };
 
+        // a bank is a single tensor, so it must also fit the device limits (Vulkan caps a tensor near 4 GiB)
+        auto bank_supported = [&](const group & g, int32_t n_slots) {
+            for (const ggml_tensor * t : g.ref) {
+                ggml_tensor bank = *t;
+                bank.op       = GGML_OP_NONE;
+                bank.ne[2]    = n_slots + 1;
+                bank.nb[3]    = bank.nb[2]*bank.ne[2];
+                bank.view_src = nullptr;
+                bank.buffer   = nullptr;
+                std::fill(std::begin(bank.src), std::end(bank.src), nullptr);
+                if (!ggml_backend_supports_op(devices[g.id].backend, &bank)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
         // the budget is split among the devices with host experts like the layers, by the tensor split or by default by free memory
         const float * tensor_split = model.tensor_split();
         const bool split_by_free = tensor_split == nullptr ||
@@ -350,7 +367,7 @@ struct llama_moe_cache::impl {
             const int32_t n_expert  = g.ref[0]->ne[2];
             const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
             const int32_t max_slots = g.layers.size()*n_expert;
-            while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
+            while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget && bank_supported(g, g.n_slots + 1)) {
                 g.n_slots++;
             }
             if (g.n_slots < n_expert_used) {
