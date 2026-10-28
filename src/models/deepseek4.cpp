@@ -1355,7 +1355,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
 
     ggml_tensor * h_nextn = cparams.embeddings_nextn_masked ? flat_out : inpL;
-    cb(h_nextn, "h_nextn", -1);
+    // keep the l_last name of the last layer, a residual capture looks it up
+    if (h_nextn != inpL) {
+        cb(h_nextn, "h_nextn", -1);
+    }
     res->t_h_nextn = h_nextn;
 
     if (inp_out_ids) {
