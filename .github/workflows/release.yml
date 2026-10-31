@@ -1220,9 +1220,6 @@ jobs:
           - cuda: '13.5'
             arch: x64
             defines: ''
-          - cuda: '13.5'
-            arch: arm64
-            defines: '-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake'
 
     steps:
       - name: Clone
