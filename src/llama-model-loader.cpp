@@ -588,6 +588,46 @@ llama_model_loader::llama_model_loader(
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         contexts.emplace_back(ctx);
 
+        // tensor data stored in other files: per tensor, a file index (-1 = this file) and an absolute offset
+        const int32_t  * ext_idx  = nullptr;
+        const uint64_t * ext_offs = nullptr;
+        size_t ext_first = 0;
+        size_t n_ext     = 0;
+        const int kid_ext_files = gguf_find_key(metadata, "general.external_data.files");
+        if (kid_ext_files >= 0) {
+            const int kid_ext_idx  = gguf_find_key(metadata, "general.external_data.tensor_files");
+            const int kid_ext_offs = gguf_find_key(metadata, "general.external_data.tensor_offsets");
+            const int64_t n_tensors_meta = gguf_get_n_tensors(metadata);
+            const auto is_arr = [&](int kid, gguf_type type) {
+                return kid >= 0 && gguf_get_kv_type(metadata, kid) == GGUF_TYPE_ARRAY && gguf_get_arr_type(metadata, kid) == type;
+            };
+            if (!is_arr(kid_ext_files, GGUF_TYPE_STRING) || !is_arr(kid_ext_idx, GGUF_TYPE_INT32) || !is_arr(kid_ext_offs, GGUF_TYPE_UINT64) ||
+                (int64_t) gguf_get_arr_n(metadata, kid_ext_idx) != n_tensors_meta ||
+                (int64_t) gguf_get_arr_n(metadata, kid_ext_offs) != n_tensors_meta) {
+                throw std::runtime_error("invalid external tensor data metadata");
+            }
+
+            std::string dir;
+            const size_t sep = fname.find_last_of("/\\");
+            if (sep != std::string::npos) {
+                dir = fname.substr(0, sep + 1);
+            }
+
+            ext_first = files.size();
+            n_ext     = gguf_get_arr_n(metadata, kid_ext_files);
+            for (size_t i = 0; i < n_ext; i++) {
+                std::string path = gguf_get_arr_str(metadata, kid_ext_files, i);
+                const bool is_abs = !path.empty() && (path[0] == '/' || path[0] == '\\' || (path.size() > 1 && path[1] == ':'));
+                if (!is_abs) {
+                    path = dir + path;
+                }
+                files.emplace_back(new llama_file(path.c_str(), "rb", use_direct_io));
+            }
+            ext_idx  = (const int32_t  *) gguf_get_arr_data(metadata, kid_ext_idx);
+            ext_offs = (const uint64_t *) gguf_get_arr_data(metadata, kid_ext_offs);
+            LLAMA_LOG_INFO("%s: tensor data in %zu external files\n", __func__, n_ext);
+        }
+
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
         // so we build a unified tensors index for weights.
@@ -599,10 +639,22 @@ llama_model_loader::llama_model_loader(
             }
             n_elements += ggml_nelements(cur);
             n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+            const int64_t ti = ext_idx ? gguf_find_tensor(metadata, tensor_name.c_str()) : -1;
+            if (ti >= 0 && ext_idx[ti] >= 0) {
+                if ((size_t) ext_idx[ti] >= n_ext) {
+                    throw std::runtime_error(format("tensor '%s' names external file %d, but only %zu are listed", tensor_name.c_str(), ext_idx[ti], n_ext));
+                }
+                const uint16_t idx = (uint16_t) (ext_first + ext_idx[ti]);
+                weights_map.emplace(tensor_name, llama_tensor_weight(files[idx].get(), idx, ext_offs[ti], cur));
+            } else {
+                weights_map.emplace(tensor_name, llama_tensor_weight(files.front().get(), 0, metadata, cur));
+            }
         }
         uint16_t n_split = 0;
         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
+        if (n_split > 1 && ext_idx) {
+            throw std::runtime_error("external tensor data is not supported with split GGUF files");
+        }
 
         // Load additional GGML contexts
         if (n_split > 1) {
