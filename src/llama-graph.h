@@ -1264,7 +1264,9 @@ struct llm_graph_context {
     //
 
     // tok_scale: applied to token rows only
-    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
+    // prefer_embd: when a ubatch carries both token ids and embeddings, take the embeddings as the
+    // input (the token ids stay available to the graph, e.g. for token-hashed lookups)
+    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f, bool prefer_embd = false) const;
 
     // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_embd_state_src()),
     // or uploaded from ubatch.embd_state
