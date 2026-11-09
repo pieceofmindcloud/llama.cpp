@@ -85,6 +85,7 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+    bool external_data = false; // tensor data lives in other files (general.external_data.*)
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
