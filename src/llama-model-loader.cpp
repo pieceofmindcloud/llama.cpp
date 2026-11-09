@@ -619,6 +619,7 @@ llama_model_loader::llama_model_loader(
                 }
                 files.emplace_back(new llama_file(path.c_str(), "rb", use_direct_io));
             }
+            external_data = true;
             ext_idx  = (const int32_t  *) gguf_get_arr_data(metadata, kid_ext_idx);
             ext_offs = (const uint64_t *) gguf_get_arr_data(metadata, kid_ext_offs);
             LLAMA_LOG_INFO("%s: tensor data in %zu external files\n", __func__, n_ext);
@@ -1557,6 +1558,33 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
+        // with external data, a file may hold far more than this model uses (a range of a whole model):
+        // prefetch only the bytes of our tensors, never the whole file
+        std::map<uint32_t, llama_mmap::ranges> skip;
+        if (external_data) {
+            std::map<uint32_t, llama_mmap::ranges> used;
+            for (const auto & it : weights_map) {
+                used[it.second.idx].emplace_back(it.second.offs, it.second.offs + ggml_nbytes(it.second.tensor));
+            }
+            for (uint32_t idx = 0; idx < files.size(); idx++) {
+                auto & u = used[idx];
+                std::sort(u.begin(), u.end());
+                auto & s = skip[idx];
+                size_t pos = 0;
+                for (const auto & r : u) {
+                    if (r.first > pos) {
+                        s.emplace_back(pos, r.first);
+                    }
+                    pos = std::max(pos, r.second);
+                }
+                if (pos < files[idx]->size()) {
+                    s.emplace_back(pos, files[idx]->size());
+                }
+                const auto & lz = lazy.for_file(idx);
+                s.insert(s.end(), lz.begin(), lz.end());
+            }
+        }
+
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (uint32_t idx = 0; idx < files.size(); idx++) {
@@ -1576,7 +1604,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    external_data ? skip[idx] : lazy.for_file(idx));
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
