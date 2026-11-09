@@ -4702,8 +4702,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    // embd rows may be wider than the decoder input, see llama_batch.n_embd
-    const size_t n_embd_row = batch_inp.embd && !batch_inp.token && batch_inp.n_embd > 0 ? (size_t) batch_inp.n_embd : 0;
+    // embd rows may be wider than the decoder input, see llama_batch.n_embd; also with token ids beside
+    // them (a deepseek41 layer-boundary state), which a context without an MTP state reads as embeddings
+    const size_t n_embd_row = batch_inp.embd && batch_inp.n_embd > 0 ? (size_t) batch_inp.n_embd : 0;
     llama_batch_compat compat(this, batch_inp, n_embd_row);
     return decode(*compat.batch_ext);
 }
