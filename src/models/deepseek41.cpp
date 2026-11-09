@@ -23,7 +23,12 @@ static bool dsv41_env_on(const char * name) {
 void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     llama_model_deepseek4::load_arch_hparams(ml);
 
-    hparams.n_embd_out_impl = hparams.n_embd; // no hc_head
+    // No hc_head: the output collapses the hc streams with the last FFN's pre-mix, which is not part
+    // of the residual. A graph that stops at a layer boundary therefore hands on hc streams plus that
+    // pre-mix, packed as one more n_embd-wide stream ([n_embd, hc + 1] per token, the pre-mix in the
+    // first hc values of the last stream), and a graph that starts at a boundary takes the same width
+    // as embedding input.
+    hparams.n_embd_out_impl = (hparams.dsv4_hc_mult + 1) * hparams.n_embd;
     if (hparams.indexer_top_k == 0) {
         throw std::runtime_error("DeepSeek-V4.1 indexer top_k must be > 0");
     }
@@ -824,11 +829,23 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     res->add_input(std::move(inp41));
 
     const int64_t hc = hparams.dsv4_hc_mult;
-    ggml_tensor * inpL = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
-    cb(inpL, "hc_init", -1);
 
     // single-pass mHC: the pre-mix used to collapse the stream lags one sublayer
     ggml_tensor * pre_prev = nullptr;
+
+    // a boundary state is text continuing from an earlier layer, not image embeddings
+    const bool state_input = !ubatch.token && inp->ne[0] == n_embd*(hc + 1);
+    ggml_tensor * inpL;
+    if (state_input) {
+        // continuing from a layer boundary: the hc streams and the previous FFN's pre-mix
+        ggml_tensor * state = ggml_reshape_3d(ctx0, inp, n_embd, hc + 1, n_tokens);
+        inpL     = ggml_cont(ctx0, ggml_view_3d(ctx0, state, n_embd, hc, n_tokens, state->nb[1], state->nb[2], 0));
+        pre_prev = ggml_cont(ctx0, ggml_view_2d(ctx0, state, hc, n_tokens, state->nb[2], hc*state->nb[1]));
+        cb(pre_prev, "hc_pre_in", -1);
+    } else {
+        inpL = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+    }
+    cb(inpL, "hc_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -882,7 +899,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
         // image (embedding) tokens use the vision router bias, as DeepSeek-V4
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
-        if (ubatch.embd != nullptr && layer.ffn_exp_probs_b_vl) {
+        if (ubatch.embd != nullptr && !state_input && layer.ffn_exp_probs_b_vl) {
             exp_probs_b = layer.ffn_exp_probs_b_vl;
         }
 
@@ -912,7 +929,16 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
         inpL = build_hc_post(cur, residual, ffn_mix.post, ffn_mix.comb, il);
         inpL = build_cvec(inpL, il);
-        cb(inpL, "l_out", il);
+        if (il == n_layer - 1) {
+            // the state a graph continuing from this boundary needs (see load_arch_hparams)
+            ggml_tensor * pre_row = ggml_pad(ctx0, ggml_reshape_3d(ctx0, pre_prev, hc, 1, n_tokens), n_embd - hc, 0, 0, 0);
+            ggml_tensor * state   = ggml_concat(ctx0, inpL, pre_row, 1);
+            cb(inpL, "l_hc", il);
+            cb(state, "l_out", il);
+            ggml_build_forward_expand(gf, state);
+        } else {
+            cb(inpL, "l_out", il);
+        }
     }
 
     // no hc_head: collapse with the last FFN's pre-mix
