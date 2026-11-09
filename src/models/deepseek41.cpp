@@ -23,7 +23,12 @@ static bool dsv41_env_on(const char * name) {
 void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     llama_model_deepseek4::load_arch_hparams(ml);
 
-    hparams.n_embd_out_impl = hparams.n_embd; // no hc_head
+    // No hc_head: the output collapses the hc streams with the last FFN's pre-mix, which is not part
+    // of the residual. A graph that stops at a layer boundary therefore hands on hc streams plus that
+    // pre-mix, packed as one more n_embd-wide stream ([n_embd, hc + 1] per token, the pre-mix in the
+    // first hc values of the last stream), and a graph that starts at a boundary takes the same width
+    // as embedding input.
+    hparams.n_embd_out_impl = (hparams.dsv4_hc_mult + 1) * hparams.n_embd;
     if (hparams.indexer_top_k == 0) {
         throw std::runtime_error("DeepSeek-V4.1 indexer top_k must be > 0");
     }
@@ -777,14 +782,19 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
     ggml_tensor * cur;
 
-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
+    // a layer-boundary state (see load_arch_hparams) may come with the token ids of its rows: the state
+    // is the input and the ids feed Engram, whose layers then run in a graph that starts mid-model
+    const int64_t n_embd_state = (int64_t) hparams.n_embd_out();
+    const bool state_input = ubatch.embd != nullptr && (int64_t) ubatch.n_embd == n_embd_state;
+    ggml_tensor * inp = build_inp_embd(model.tok_embd, 1.0f, state_input);
     ggml_tensor * inp_pos = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_kq_mask);
 
     auto inp41 = std::make_unique<llm_graph_input_dsv41>(model, inp_dsv4->mctx);
-    // embedding input has no token ids: it skips Engram, like the reference's masked (image) positions
+    // embedding input without token ids skips Engram, like the reference's masked (image) positions; a
+    // layer-boundary state sent with its token ids keeps it
     // the gathers go right after the token embeddings, so they share the first graph split (the table stays on the host)
     std::vector<ggml_tensor *> engram_rows;
     for (int il = 0; ubatch.token && hparams.ple_n_heads > 0 && il < n_layer; ++il) {
@@ -824,11 +834,23 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     res->add_input(std::move(inp41));
 
     const int64_t hc = hparams.dsv4_hc_mult;
-    ggml_tensor * inpL = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
-    cb(inpL, "hc_init", -1);
 
     // single-pass mHC: the pre-mix used to collapse the stream lags one sublayer
     ggml_tensor * pre_prev = nullptr;
+
+    // a boundary state is text continuing from an earlier layer, not image embeddings
+    GGML_ASSERT(!state_input || inp->ne[0] == n_embd*(hc + 1));
+    ggml_tensor * inpL;
+    if (state_input) {
+        // continuing from a layer boundary: the hc streams and the previous FFN's pre-mix
+        ggml_tensor * state = ggml_reshape_3d(ctx0, inp, n_embd, hc + 1, n_tokens);
+        inpL     = ggml_cont(ctx0, ggml_view_3d(ctx0, state, n_embd, hc, n_tokens, state->nb[1], state->nb[2], 0));
+        pre_prev = ggml_cont(ctx0, ggml_view_2d(ctx0, state, hc, n_tokens, state->nb[2], hc*state->nb[1]));
+        cb(pre_prev, "hc_pre_in", -1);
+    } else {
+        inpL = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+    }
+    cb(inpL, "hc_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -882,7 +904,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
         // image (embedding) tokens use the vision router bias, as DeepSeek-V4
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
-        if (ubatch.embd != nullptr && layer.ffn_exp_probs_b_vl) {
+        if (ubatch.embd != nullptr && !state_input && layer.ffn_exp_probs_b_vl) {
             exp_probs_b = layer.ffn_exp_probs_b_vl;
         }
 
@@ -912,7 +934,16 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
         inpL = build_hc_post(cur, residual, ffn_mix.post, ffn_mix.comb, il);
         inpL = build_cvec(inpL, il);
-        cb(inpL, "l_out", il);
+        if (il == n_layer - 1) {
+            // the state a graph continuing from this boundary needs (see load_arch_hparams)
+            ggml_tensor * pre_row = ggml_pad(ctx0, ggml_reshape_3d(ctx0, pre_prev, hc, 1, n_tokens), n_embd - hc, 0, 0, 0);
+            ggml_tensor * state   = ggml_concat(ctx0, inpL, pre_row, 1);
+            cb(inpL, "l_hc", il);
+            cb(state, "l_out", il);
+            ggml_build_forward_expand(gf, state);
+        } else {
+            cb(inpL, "l_out", il);
+        }
     }
 
     // no hc_head: collapse with the last FFN's pre-mix

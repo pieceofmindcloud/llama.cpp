@@ -2975,7 +2975,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
 }
 
 // input embeddings with optional lora
-ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
+ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale, bool prefer_embd) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
     const bool vector_input  = ubatch.embd != nullptr;
@@ -3102,7 +3102,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         assert(ggml_are_same_stride(inps[0], inps[2]));
     }
 
-    const int idx = ubatch.is_mixed() ? 2 : ubatch.token ? 0 : 1;
+    const int idx = ubatch.is_mixed() ? 2 : (ubatch.token && !(prefer_embd && ubatch.embd)) ? 0 : 1;
 
     ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), has_mixed ? 3 : 2, idx);
 
