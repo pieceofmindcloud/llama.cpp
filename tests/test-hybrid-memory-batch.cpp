@@ -57,6 +57,7 @@ int main(int argc, char ** argv) {
     constexpr llama_pos first_pos = 747500;
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
+    llama_pos next_pos = first_pos;
     for (int round = 0; round < n_rounds; ++round) {
         common_batch batch(ctx);
         for (int seq = 0; seq < n_seqs; ++seq) {
@@ -64,7 +65,7 @@ int main(int argc, char ** argv) {
             for (int offset = 0; offset < n_tokens_per_seq; ++offset) {
                 const int row = seq * n_tokens_per_seq + offset;
                 const llama_token token = 1 + (row + round) % std::max(1, n_vocab - 1);
-                batch.add(token, first_pos + round * n_tokens_per_seq + offset,
+                batch.add(token, next_pos + offset,
                         seq_id, offset + 1 == n_tokens_per_seq);
             }
         }
@@ -75,12 +76,41 @@ int main(int argc, char ** argv) {
             llama_free(ctx);
             return 1;
         }
+        next_pos += n_tokens_per_seq;
 
         // Exercise the recurrent snapshot path after a concurrent decode. The
         // production gateway can invalidate the last few tokens independently
-        // for every active sequence before replaying them.
+        // for every active sequence before replaying them. A long ubatch only
+        // guarantees its final state, so the tokens to roll back are decoded
+        // as a short ubatch of their own first.
         if (round == 0 || round == 3) {
-            const llama_pos rollback_pos = first_pos + round * n_tokens_per_seq + n_tokens_per_seq - n_rollback;
+            // one token more than the rollback: the state before the short ubatch is no snapshot
+            const llama_pos tail_pos = next_pos;
+            const llama_pos rollback_pos = tail_pos + 1;
+
+            common_batch tail(ctx);
+            for (int seq = 0; seq < n_seqs; ++seq) {
+                const int seq_id = first_seq + seq;
+                for (int offset = 0; offset <= n_rollback; ++offset) {
+                    const int row = seq * (n_rollback + 1) + offset;
+                    const llama_token token = 1 + (row + round + 5) % std::max(1, n_vocab - 1);
+                    tail.add(token, tail_pos + offset, seq_id, offset == n_rollback);
+                }
+            }
+
+            const int tail_rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, tail.get());
+            if (tail_rc != 0) {
+                fprintf(stderr, "%s: tail decode failed at round %d with rc=%d\n", __func__, round, tail_rc);
+                llama_free(ctx);
+                return 1;
+            }
+
+            // a rollback past the snapshots of the last ubatch is refused, not silently wrong
+            if (llama_memory_seq_rm(llama_get_memory(ctx), first_seq, tail_pos, -1)) {
+                fprintf(stderr, "%s: rollback past the last ubatch accepted at round %d\n", __func__, round);
+                llama_free(ctx);
+                return 1;
+            }
             for (int seq = 0; seq < n_seqs; ++seq) {
                 const int seq_id = first_seq + seq;
                 if (!llama_memory_seq_rm(llama_get_memory(ctx), seq_id, rollback_pos, -1)) {
@@ -106,6 +136,7 @@ int main(int argc, char ** argv) {
                 llama_free(ctx);
                 return 1;
             }
+            next_pos += n_rollback + 1;
         }
     }
 
