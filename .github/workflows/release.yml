@@ -102,7 +102,8 @@ jobs:
         include:
           - build: 'arm64'
             arch: 'arm64'
-            os: macos-26
+            # POM: macos-15 instead of macos-26, whose hosted queue cancelled the job.
+            os: macos-15
             defines: "-DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
           # TODO: this build is disabled to save Github Actions resources (https://github.com/ggml-org/llama.cpp/pull/23780)
           #       in order to enable it again, we have to provision dedicated runners  to run it
@@ -1636,60 +1637,8 @@ jobs:
         with:
           key: release-ubuntu-24.04-rocm-${{ matrix.ROCM_VERSION }}-${{ matrix.build }}
 
-  ios-xcode:
-    needs: [check-release]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
-    runs-on: macos-26
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Setup Xcode
-        run: |
-          sudo xcode-select -s /Applications/Xcode_26.4.app
-
-      - name: Build
-        id: cmake_build
-        run: |
-          sysctl -a
-          cmake -B build -G Xcode \
-            -DGGML_METAL_EMBED_LIBRARY=ON \
-            -DLLAMA_OPENSSL=OFF \
-            -DLLAMA_BUILD_APP=OFF \
-            -DLLAMA_BUILD_EXAMPLES=OFF \
-            -DLLAMA_BUILD_TOOLS=OFF \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_SERVER=OFF \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
-            -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml
-          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
-
-      - name: xcodebuild for swift package
-        id: xcodebuild
-        run: |
-          # note: only macos and ios-device due to long build time
-          # ref: https://github.com/ggml-org/llama.cpp/pull/27252
-          ./build-xcframework.sh macos ios-device
-
-      - name: Build Xcode project
-        run: xcodebuild -project examples/llama.swiftui/llama.swiftui.xcodeproj -scheme llama.swiftui -sdk iphoneos CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= -destination 'generic/platform=iOS' FRAMEWORK_FOLDER_PATH=./build-ios build
-
-      - name: Pack artifacts
-        id: pack_artifacts
-        run: |
-          # Zip file is required for Swift Package Manager, which does not support tar.gz for binary targets.
-          # For more details, see https://developer.apple.com/documentation/xcode/distributing-binary-frameworks-as-swift-packages
-          zip -r -y llama-${{ needs.check-release.outputs.tag_name }}-xcframework.zip build-apple/llama.xcframework
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          path: llama-${{ needs.check-release.outputs.tag_name }}-xcframework.zip
-          archive: false
+  # POM: no iOS XCFramework release; the hosted macos-26 queue cancelled it and the
+  # POM does not ship it.
 
 # TODO: this build is disabled to save Github Actions resources (https://github.com/ggml-org/llama.cpp/pull/23705)
 #       in order to enable it again, we have to provision dedicated runners  to run it
