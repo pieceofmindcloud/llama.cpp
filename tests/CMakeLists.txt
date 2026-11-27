@@ -161,7 +161,7 @@ if (NOT WIN32)
         NAME test-tokenizers-ggml-vocabs
         LABEL behavior
         WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-        ARGS https://huggingface.co/ggml-org/vocabs ${PROJECT_SOURCE_DIR}/models/ggml-vocabs
+        ARGS https://huggingface.co/ggml-org-dev/vocabs ${PROJECT_SOURCE_DIR}/models/ggml-vocabs
     )
 endif()
 
@@ -242,9 +242,15 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     set_tests_properties(test-generate-fp8-models PROPERTIES FIXTURES_SETUP fp8-models)
     llama_test(test-fp8 NAME test-fp8-requantize LABEL "main behavior backend"
         ARGS --models "${FP8_MODEL_DIR}")
+    set(FP8_KV_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8-kv")
+    file(MAKE_DIRECTORY "${FP8_KV_MODEL_DIR}")
+    llama_test(test-llama-archs NAME test-generate-fp8-kv-models LABEL "main behavior backend"
+        ARGS -a "^(llama|gemma3)$" -s 1 -o "${FP8_KV_MODEL_DIR}")
+    set_tests_properties(test-generate-fp8-kv-models PROPERTIES FIXTURES_SETUP fp8-kv-models)
     llama_test(test-fp8 NAME test-fp8-kv LABEL "main behavior backend"
-        ARGS --models "${FP8_MODEL_DIR}" --kv)
-    set_tests_properties(test-fp8-requantize test-fp8-kv PROPERTIES FIXTURES_REQUIRED fp8-models)
+        ARGS --models "${FP8_KV_MODEL_DIR}" --kv)
+    set_tests_properties(test-fp8-requantize PROPERTIES FIXTURES_REQUIRED fp8-models)
+    set_tests_properties(test-fp8-kv PROPERTIES FIXTURES_REQUIRED fp8-kv-models)
 endif()
 
 set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
@@ -339,15 +345,16 @@ llama_build_and_test(
 )
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
-    set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
+    set(MODEL_NAME "stories15M-q4_0.gguf")
     set(MODEL_HASH "SHA256=66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739")
 else()
-    set(MODEL_NAME "tinyllamas/stories15M-be.Q4_0.gguf")
+    set(MODEL_NAME "stories15M-be.Q4_0.gguf")
     set(MODEL_HASH "SHA256=9aec857937849d976f30397e97eb1cabb53eb9dcb1ce4611ba8247fb5f44c65d")
 endif()
 set(MODEL_DEST "${CMAKE_BINARY_DIR}/${MODEL_NAME}")
 
 add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
+    -DREPO=ggml-org-dev/stories15M
     -DDEST=${MODEL_DEST}
     -DNAME=${MODEL_NAME}
     -DHASH=${MODEL_HASH}
@@ -363,6 +370,7 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
+llama_build_and_test(test-quantize-target.cpp  LABEL "main behavior backend"  LINK llama)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
@@ -380,6 +388,8 @@ endif()
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
+llama_build_and_test(test-sleep.cpp LINK ggml)
+llama_build_and_test(test-backend-sched.cpp LINK ggml)
 
 if (BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp LABEL behavior)
@@ -412,7 +422,7 @@ endif()
 # libmtmd
 llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
 
-llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd)
+llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd llama-common)
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

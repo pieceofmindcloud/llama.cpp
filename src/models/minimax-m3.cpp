@@ -24,6 +24,12 @@ void llama_model_minimax_m3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,    hparams.indexer_block_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,  hparams.indexer_local_blocks);
 
+    // BC for MiniMax-M3 GGUFs without indexer_types metadata: leading dense layers have no indexer
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        hparams.is_indexer_full_impl[il] = il >= hparams.n_layer_dense_lead;
+    }
+    ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
+
     msa_p = {
         /*.blk          =*/ (int) hparams.indexer_block_size,
         /*.topk_blocks  =*/ (int) hparams.indexer_top_k,
@@ -79,8 +85,9 @@ void llama_model_minimax_m3::load_arch_tensors(llama_model_loader &) {
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        n_ff_exp * n_expert_shared, n_embd}, 0);
             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
+        }
 
-            // indexer
+        if (hparams.is_indexer_full(i)) {
             layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, hparams.indexer_n_head * hparams.indexer_head_size}, 0);
             layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", i), {n_embd, hparams.indexer_head_size}, 0);
             layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", i), {hparams.indexer_head_size}, 0);
@@ -300,7 +307,11 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    const bool extract_last = (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
+
     for (int il = 0; il < n_layer; ++il) {
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         // self-attention
@@ -325,10 +336,10 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            const bool is_sparse = msa_enabled && il >= (int) hparams.n_layer_dense_lead;
+            const bool is_sparse = msa_enabled && hparams.is_indexer_full(il);
 
             if (!is_sparse) {
-                cur = build_attn(inp_attn, model.layers[il].wo, NULL, model.layers[il].wo_s,
+                cur = build_attn(inp_attn, model.layers[il].wo, NULL,
                         Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                         1.0f/sqrtf(float(n_embd_head)), il);
             } else {
@@ -524,12 +535,12 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
                 }
                 cb(cur, "kqv_out", il);
                 if (model.layers[il].wo) {
-                    cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+                    cur = build_lora_mm(model.layers[il].wo, cur);
                 }
             }
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && !extract_last) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -543,9 +554,9 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             // leading dense FFN (swigluoai)
             cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
-                    model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
-                    model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+                    model.layers[il].ffn_up,   NULL,
+                    model.layers[il].ffn_gate, NULL,
+                    model.layers[il].ffn_down, NULL,
                     NULL,
                     LLM_FFN_SWIGLU_OAI_MOE, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
@@ -561,17 +572,14 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
                     LLM_FFN_SWIGLU_OAI_MOE, hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il, nullptr, nullptr,
-                    model.layers[il].ffn_up_exps_s,
-                    model.layers[il].ffn_gate_exps_s,
-                    model.layers[il].ffn_down_exps_s);
+                    il);
             cb(moe_out, "ffn_moe_out", il);
 
             // shared expert (swigluoai)
             ggml_tensor * ffn_shexp = build_ffn(cur,
-                    model.layers[il].ffn_up_shexp,   NULL, model.layers[il].ffn_up_shexp_s,
-                    model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                    model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                    model.layers[il].ffn_up_shexp,   NULL,
+                    model.layers[il].ffn_gate_shexp, NULL,
+                    model.layers[il].ffn_down_shexp, NULL,
                     NULL,
                     LLM_FFN_SWIGLU_OAI_MOE, LLM_FFN_PAR, il);
             cb(ffn_shexp, "ffn_shexp", il);
@@ -589,6 +597,13 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
         inpL = cur;
     }
 
+    if (extract_last) {
+        res->t_layer_inp[n_layer] = inpL;
+        if (inp_out_ids) {
+            inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+        }
+    }
+
     cur = inpL;
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
@@ -596,7 +611,7 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }

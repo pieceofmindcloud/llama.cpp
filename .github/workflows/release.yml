@@ -134,7 +134,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: llama-ui.zip
-          path: tools/ui/dist
+          path: ui/apps/chat/dist
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
@@ -195,7 +195,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: llama-ui.zip
-          path: tools/ui/dist
+          path: ui/apps/chat/dist
 
       - name: Dependencies
         id: depends
@@ -269,7 +269,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: llama-ui.zip
-          path: tools/ui/dist
+          path: ui/apps/chat/dist
 
       - name: Dependencies
         id: depends
@@ -366,7 +366,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: llama-ui.zip
-          path: tools/ui/dist
+          path: ui/apps/chat/dist
 
       - name: Dependencies
         id: depends
@@ -466,11 +466,16 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: llama-ui.zip
-          path: tools/ui/dist
+          path: ui/apps/chat/dist
 
       - name: Install Ninja
         run: |
           choco install ninja
+
+      - name: Install LLVM
+        run: |
+          choco install llvm --version=22.1.8
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
@@ -556,6 +561,11 @@ jobs:
         id: install_ninja
         run: |
           choco install ninja
+
+      - name: Install LLVM
+        run: |
+          choco install llvm --version=22.1.8
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
 
       # TODO: these jobs need to use llvm toolchain in order to utilize the ccache
       #- name: ccache
@@ -644,6 +654,7 @@ jobs:
         with:
           key: release-windows-2022-${{ matrix.arch }}-cuda-${{ matrix.cuda }}
           evict-old-files: 1d
+          max-size: "1G"
 
       - name: Build
         id: cmake_build
