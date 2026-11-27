@@ -2,6 +2,8 @@
 #include "../llama-memory-hybrid-iswa.h"
 
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
+    ml.get_key("pom.start_layer", source_start_layer, false);
+    ml.get_key("pom.original_block_count", source_total_layers, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
     ml.get_key(LLM_KV_ATTN_RES_BLOCK_SIZE,         hparams.attn_res_block_size);
@@ -50,6 +52,24 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
 
     if (!std::isfinite(hparams.f_log_scale_alpha) || hparams.f_log_scale_alpha < 0.0f) {
         throw std::runtime_error("inkling2: invalid logarithmic scale");
+    }
+
+    if (source_total_layers > 0) {
+        const uint32_t local_layers = hparams.n_layer();
+        if (source_start_layer > source_total_layers ||
+            local_layers > source_total_layers - source_start_layer ||
+            source_start_layer % hparams.attn_res_block_size != 0 ||
+            (source_start_layer + local_layers != source_total_layers &&
+                (source_start_layer + local_layers) % hparams.attn_res_block_size != 0)) {
+            throw std::runtime_error("inkling2: invalid source layer range");
+        }
+    } else if (source_start_layer != 0) {
+        throw std::runtime_error("inkling2: source start is set without a source layer count");
+    }
+    // a slice after the first takes the residual-block bank beside the running
+    // state: one n_embd vector per completed block plus the current one
+    if (source_start_layer > 0) {
+        hparams.n_embd_inp_impl = hparams.n_embd * (source_start_layer / hparams.attn_res_block_size + 1);
     }
 
     hparams.swa_type                = LLAMA_SWA_TYPE_STANDARD;
@@ -143,7 +163,8 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         }
 
         // block attention residuals
-        if (i > 0) {
+        // the bank is empty only at the source model's first layer, not a slice's
+        if (source_start_layer + i > 0) {
             layer.attn_res_query = create_tensor(tn(LLM_TENSOR_ATTN_RES_QUERY, "weight", i), {n_embd, hparams.is_swa(i) ? 1 : 3}, TENSOR_NO_SCALE);
         }
         layer.ffn_res_query = create_tensor(tn(LLM_TENSOR_FFN_RES_QUERY, "weight", i), {n_embd}, TENSOR_NO_SCALE);
@@ -272,7 +293,7 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
 }
 
-ggml_tensor * llama_model_inkling2::graph::build_inputs() {
+ggml_tensor * llama_model_inkling2::graph::build_inputs(std::vector<ggml_tensor *> & blocks) {
     inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
     recr = inp->get_recr();
 
@@ -285,9 +306,47 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     tau = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, tau, hparams.f_log_scale_alpha, 1.0f), 1, 1, n_tokens);
     ggml_build_forward_expand(gf, tau);
 
-    ggml_tensor * cur = build_inp_embd(model.tok_embd);
+    const auto & inkling = static_cast<const llama_model_inkling2 &>(model);
+    ggml_tensor * cur = build_inp_embd(model.tok_embd, 1.0f, inkling.source_start_layer > 0);
 
-    // important: do not normalize raw embeddings input (i.e. encoded image embeddings)
+    if (inkling.source_start_layer > 0) {
+        const uint32_t block_size = hparams.attn_res_block_size;
+        GGML_ASSERT(block_size > 0 && inkling.source_start_layer % block_size == 0);
+        const int64_t n_streams = inkling.source_start_layer / block_size + 1;
+        // n_embd_inp is the bank width, so build_inp_embd hands back a view of
+        // the first n_embd features; the whole input row is its source
+        if (!ubatch.embd) {
+            // Graph reservation runs a token batch: stand in for the bank with
+            // copies of the embedding so the graph has the shape of a real step.
+            cur = ggml_cont(ctx0, cur);
+            for (int64_t stream = 0; stream + 1 < n_streams; ++stream) {
+                blocks.push_back(cur);
+            }
+            return cur;
+        }
+        if (cur->view_src && cur->ne[0] != n_embd * n_streams) {
+            cur = cur->view_src;
+        }
+        GGML_ASSERT(cur->ne[0] == n_embd * n_streams && ggml_is_contiguous(cur));
+
+        // The wire layout is [tokens, n_embd, streams], with streams innermost.
+        // Split the interleaved feature axis into one contiguous vector per
+        // residual stream before handing it to the ordinary Inkling graph.
+        auto * interleaved = ggml_reshape_3d(ctx0, cur, n_streams, n_embd, n_tokens);
+        for (int64_t stream = 0; stream < n_streams; ++stream) {
+            auto * view = ggml_view_3d(ctx0, interleaved, 1, n_embd, n_tokens,
+                    interleaved->nb[1], interleaved->nb[2], stream*interleaved->nb[0]);
+            auto * state = ggml_cont_2d(ctx0, view, n_embd, n_tokens);
+            if (stream + 1 == n_streams) {
+                cur = state;
+            } else {
+                blocks.push_back(state);
+            }
+        }
+        return cur;
+    }
+
+    // Important: do not normalize raw embeddings input (i.e. encoded image embeddings).
     if (ubatch.token) {
         cur = build_norm(cur, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
     }
@@ -395,7 +454,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     }
 
     // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
-    if (ip % hparams.attn_res_block_size == 0) {
+    if ((static_cast<const llama_model_inkling2 &>(model).source_start_layer + ip) % hparams.attn_res_block_size == 0) {
         blocks.push_back(inpSA);
     } else {
         cur = ggml_add(ctx0, inpSA, cur);
@@ -438,11 +497,22 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 }
 
 void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
+    const auto & inkling = static_cast<const llama_model_inkling2 &>(model);
+    const bool partial_shard = inkling.source_total_layers > 0 &&
+        inkling.source_start_layer + inkling.n_layer_phys() < inkling.source_total_layers;
+    // A pipeline shard exports the raw state entering the next layer. Keep it
+    // in the final layer-input slot so it follows llama.cpp's normal row order.
+    if (partial_shard) {
+        res->t_layer_inp[n_layer] = cur;
+    }
+
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
-    // DSpark target features: the last one is the final norm output of every token
-    res->t_layer_inp[n_layer] = cur;
+    // Whole-model callers retain the traditional post-output-norm embedding.
+    if (!partial_shard) {
+        res->t_layer_inp[n_layer] = cur;
+    }
 
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
@@ -468,13 +538,12 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
 }
 
 llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
-    ggml_tensor * cur = build_inputs();
-
     std::vector<ggml_tensor *> blocks;
+    ggml_tensor * cur = build_inputs(blocks);
     for (int il = 0; il < n_layer; ++il) {
         // DSpark target features: the partial block at the layer input
         res->t_layer_inp[il] = cur;
-        cur = build_layer(il, il, cur, blocks);
+        cur = build_layer(il, static_cast<const llama_model_inkling2 &>(model).source_start_layer + il, cur, blocks);
     }
 
     build_output(cur, blocks);

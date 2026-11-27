@@ -2644,6 +2644,10 @@ struct llama_model_inkling2 : public llama_model_base {
 
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
+    // Global origin recorded by the POM slicer; residual blocks are indexed in
+    // source-model coordinates even though this file renumbers its layers.
+    uint32_t source_start_layer = 0;
+    uint32_t source_total_layers = 0;
 
     // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
     enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
@@ -2675,7 +2679,7 @@ struct llama_model_inkling2 : public llama_model_base {
         graph(const llm_graph_params & params, no_build) : llm_graph_context(params) {}
 
         // the inputs and the token embeddings
-        ggml_tensor * build_inputs();
+        ggml_tensor * build_inputs(std::vector<ggml_tensor *> & blocks);
         // cache slot il of physical layer ip; messages [LOOP_CTRL_COUNT, n_embd, n_tokens] are mixed into its inputs
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);

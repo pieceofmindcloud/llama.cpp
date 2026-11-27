@@ -15,9 +15,14 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
 
     n_phys = hparams.n_layer();
     const uint32_t block = hparams.attn_res_block_size;
-    // a fixed loop needs at least 2 passes, a variable loop at least 1
-    if (n_passes < (varying ? 1u : 2u) || !gate_rank || !core_start || core_start >= core_end || core_end > (uint32_t) n_phys ||
-        core_start % block || core_end % block || hparams.n_layer_nextn) {
+    // A shard outside the loop core carries an empty core and executes once.
+    // A core starting at local layer zero is valid when its prelude arrived as
+    // residual state from the preceding pipeline stage.
+    const bool empty_core = core_start == 0 && core_end == 0 && n_passes == 1;
+    if (!gate_rank || hparams.n_layer_nextn ||
+        (!empty_core && (n_passes < (varying ? 1u : 2u) ||
+            (core_start == 0 && source_start_layer == 0) || core_start >= core_end ||
+            core_end > (uint32_t) n_phys || core_start % block || core_end % block))) {
         throw std::runtime_error(format("inkling2_loop: invalid loop core [%u, %u) with block size %u, %u passes or gate rank %u for %d layers",
                 core_start, core_end, block, n_passes, gate_rank, n_phys));
     }
@@ -78,15 +83,15 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     const int start = m.core_start;
     const int end   = m.core_end;
 
-    auto * cur = build_inputs();
     std::vector<ggml_tensor *> blocks;
+    auto * cur = build_inputs(blocks);
 
     // DSpark target features are indexed by layer visit, not by cache slot
     int visit = 0;
 
     for (int il = 0; il < start; ++il) {
         res->t_layer_inp[visit++] = cur;
-        cur = build_layer(il, il, cur, blocks);
+        cur = build_layer(il, m.source_start_layer + il, cur, blocks);
     }
 
     // every pass starts from the prelude output
@@ -106,17 +111,17 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
             const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
             res->t_layer_inp[visit++] = cur;
             if (pass == 0) {
-                cur = build_layer(il, ip, cur, blocks);
+                cur = build_layer(il, m.source_start_layer + ip, cur, blocks);
                 continue;
             }
             const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
+            cur = build_layer(il, m.source_start_layer + ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
         }
     }
 
     for (int il = end; il < m.n_phys; ++il) {
         res->t_layer_inp[visit++] = cur;
-        cur = build_layer(il, il, cur, blocks);
+        cur = build_layer(il, m.source_start_layer + il, cur, blocks);
     }
     GGML_ASSERT(visit == n_layer);
     build_output(cur, blocks);
